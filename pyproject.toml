@@ -1,0 +1,21 @@
+[project]
+name = "istl-dev"
+version = "0.0.0"
+description = "Dev environment for the istl Rust + Python project (managed by uv)"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2",
+    "pytest>=8",
+    "numpy>=2",
+    "meshio>=5",
+]
+
+# Tell uv this is a dev-shell project, not something to be installed.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

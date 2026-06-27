@@ -1,0 +1,94 @@
+import math
+import struct
+from pathlib import Path
+
+import istl
+import meshio
+import pytest
+
+
+def _stl_triangle_count(path: Path) -> int:
+    data = path.read_bytes()
+    return struct.unpack_from("<I", data, 80)[0]
+
+
+def test_convert_round_trip(tmp_stl, tmp_path):
+    stl = tmp_stl(n=500, grid=25, name="in.stl")
+    out = tmp_path / "out.istl"
+    stats = istl.convert(str(stl), str(out), group_size=32)
+    assert stats["triangles"] == 500
+    assert stats["groups"] == math.ceil(500 / 32)
+    head = out.read_bytes()[:24]
+    # Output starts with ISTL1 magic.
+    assert head[:8] == b"ISTL1\x00\x00\x00"
+    # footer_offset (8..16) and footer_size (16..24) are exposed in the stats.
+    assert struct.unpack_from("<Q", head, 8)[0] == stats["footer_offset"]
+    assert struct.unpack_from("<Q", head, 16)[0] == stats["footer_size"]
+    # footer_offset + footer_size == file size (footer is the very tail).
+    assert stats["footer_offset"] + stats["footer_size"] == out.stat().st_size
+    # The triangle count field (bytes 80..84) is still correct, so meshio
+    # treats it as a plain binary STL.
+    assert _stl_triangle_count(out) == 500
+
+
+def test_read_index_shapes(tmp_stl, tmp_path):
+    stl = tmp_stl(n=200, grid=20, name="in.stl")
+    out = tmp_path / "out.istl"
+    istl.convert(str(stl), str(out), group_size=16)
+    idx = istl.read_index(str(out))
+    assert len(idx) == math.ceil(200 / 16)
+    g0 = idx[0]
+    for key in ("byte_start", "byte_size", "xmin", "xmax", "ymin", "ymax", "zmin", "zmax"):
+        assert key in g0
+    # First group starts at offset 84 (header + count).
+    assert g0["byte_start"] == 84
+    # All groups together cover exactly 200 * 50 bytes.
+    assert sum(g["byte_size"] for g in idx) == 200 * 50
+
+
+def test_query_subset_is_valid_stl(tmp_stl, tmp_path):
+    stl = tmp_stl(n=400, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    sliced = tmp_path / "sliced.stl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    stats = istl.query(
+        str(indexed),
+        str(sliced),
+        bbox=(3.0, 3.0, -1.0, 8.0, 8.0, 1.0),
+    )
+    assert stats["groups_matched"] >= 1
+    assert stats["triangles_written"] >= 1
+    # meshio can read it back as a normal binary STL.
+    mesh = meshio.read(str(sliced))
+    n_in_file = _stl_triangle_count(sliced)
+    assert n_in_file == stats["triangles_written"]
+    assert sum(len(c.data) for c in mesh.cells if c.type == "triangle") == n_in_file
+
+
+def test_query_superset_of_brute_force(tmp_stl, tmp_path):
+    n, grid = 300, 25
+    stl = tmp_stl(n=n, grid=grid, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    sliced = tmp_path / "sliced.stl"
+    istl.convert(str(stl), str(indexed), group_size=32)
+
+    qb = (4.0, 4.0, -1.0, 9.0, 9.0, 1.0)
+    stats = istl.query(str(indexed), str(sliced), bbox=qb)
+
+    # Brute-force scan original STL by first-vertex XY.
+    raw = stl.read_bytes()
+    expected = 0
+    for i in range(n):
+        off = 84 + i * 50 + 12  # skip normal -> first vertex
+        x, y = struct.unpack_from("<ff", raw, off)
+        if qb[0] <= x <= qb[3] and qb[1] <= y <= qb[4]:
+            expected += 1
+    assert stats["triangles_written"] >= expected
+
+
+def test_query_rejects_inverted_bbox(tmp_stl, tmp_path):
+    stl = tmp_stl(n=50, grid=10, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=16)
+    with pytest.raises(ValueError):
+        istl.query(str(indexed), str(tmp_path / "x.stl"), bbox=(5.0, 0.0, 0.0, 0.0, 1.0, 1.0))

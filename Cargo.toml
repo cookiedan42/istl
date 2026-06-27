@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/istl-core",
+    "crates/istl-cli",
+    "crates/istl-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

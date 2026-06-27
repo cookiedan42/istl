@@ -15,13 +15,15 @@ Rust with the GIL released, so calls don't block other Python threads.
 ```python
 import istl
 
-# Convert a plain binary STL to a Hilbert-indexed .istl file.
-stats = istl.convert("terrain.stl", "terrain.istl", group_size=8192)
+# Convert a plain binary STL to a Hilbert-indexed .istl file. The default
+# group_size (32,768) is tuned for object-store access (S3/GCS/Azure); see
+# the API reference below to tune for local NVMe, HDD, or edge.
+stats = istl.convert("terrain.stl", "terrain.istl")
 # stats == {
 #   "triangles": 54_103_132,
-#   "groups": 6_605,
+#   "groups": 1_652,
 #   "footer_offset": 2_705_156_684,
-#   "footer_size": 264_212,
+#   "footer_size": 66_084,
 #   "dataset_bbox": (xmin, xmax, ymin, ymax, zmin, zmax),
 # }
 
@@ -97,17 +99,32 @@ Cross-compilation, abi3, and CI examples are covered in the
 
 ## API reference
 
-### `istl.convert(input, output, group_size=8192) -> dict`
+### `istl.convert(input, output, group_size=istl.DEFAULT_GROUP_SIZE) -> dict`
 
 Sort the triangles of a binary STL along a Hilbert curve (XY of first vertex,
 mapped onto a 65,536 × 65,536 grid) and write an `.istl` file with a footer
 index recording each row group's byte range and 3D bbox. Returns a dict with
 `triangles`, `groups`, `footer_offset`, `footer_size`, `dataset_bbox`.
 
-`group_size` controls the number of triangles per row group. Default 8,192 is
-a reasonable balance for terrain-scale data. Smaller groups give tighter
-per-group bboxes (more selective queries, fewer wasted triangles per match)
-but a larger footer; larger groups give a cheaper index but coarser queries.
+`group_size` controls the number of triangles per row group. The default
+(`istl.DEFAULT_GROUP_SIZE = 32,768`, ~1.6 MB per group) targets object-store
+access (S3 / GCS / Azure Blob) — each group sits in the efficient
+parallel-GET band, and the footer fits a single ~64 KB speculative tail
+range request. Tune per deployment:
+
+| Workload | Suggested `group_size` |
+|---|---|
+| Local NVMe / mmap, tight AOIs | `8_192` |
+| **S3 / GCS / Azure (default)** | **`32_768`** |
+| S3 Express One Zone (lower TTFB) | `16_384` |
+| HDD / NFS / EFS | `131_072` |
+| Generic HTTP server, edge, high-latency | `131_072+` |
+
+Smaller groups give tighter per-group bboxes (more selective queries, fewer
+wasted triangles per match) but more requests per query. Larger groups give
+a smaller index and fewer requests, at the cost of more over-fetch per
+match. The format itself is agnostic — this is a writer-side knob you can
+re-tune per deployment by re-running `convert`.
 
 ### `istl.query(input, output, bbox) -> dict`
 
@@ -125,18 +142,24 @@ file on S3.
 
 ```
 bytes  0..8   : MAGIC "ISTL1\0\0\0"
-bytes  8..16  : footer_offset  u64 LE
-bytes 16..24  : footer_size    u64 LE
-bytes 24..80  : reserved (zeroed)
-bytes 80..84  : triangle_count u32 LE   ← valid plain-STL count
+bytes  8..80  : reserved (zeroed, 72 B)
+bytes 80..84  : triangle_count u32 LE     ← valid plain-STL count
 bytes 84..    : triangles (50 B each, Hilbert-sorted)
-... footer @ footer_offset, footer_size bytes:
+... footer payload (just before the tail):
     4 B group_count u32
     group_count × 40 B records: byte_start u64, byte_size u64, bbox (6× f32)
-    8 B trailer "ISTLEND\0"
+last 16 B     : footer_size u64 LE + TRAILER "ISTLEND\0"
 ```
 
-The invariant `footer_offset + footer_size == file_size` always holds.
+The footer is **self-locating from the tail** (the same pattern Parquet uses):
+a reader looks at the last 16 bytes to find the trailer magic and
+`footer_size`, then reads `footer_size` bytes immediately before the tail to
+get the index. Invariant: `file_size = 84 + 50 × triangle_count + footer_size + 16`.
+
+This makes the format friendly to range-GET access on S3: one speculative
+`GET Range: bytes=-N` (e.g. `N = 64 KB`) typically retrieves the trailer
+magic, `footer_size`, and the entire footer in a single round trip. Once the
+index is in hand, follow-up GETs fetch only the matching row-group slabs.
 
 Because the format keeps the original binary-STL header structure (just with
 magic in the unused-by-spec first bytes), the file remains parseable by any

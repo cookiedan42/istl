@@ -18,14 +18,17 @@ def test_convert_round_trip(tmp_stl, tmp_path):
     stats = istl.convert(str(stl), str(out), group_size=32)
     assert stats["triangles"] == 500
     assert stats["groups"] == math.ceil(500 / 32)
-    head = out.read_bytes()[:24]
-    # Output starts with ISTL1 magic.
-    assert head[:8] == b"ISTL1\x00\x00\x00"
-    # footer_offset (8..16) and footer_size (16..24) are exposed in the stats.
-    assert struct.unpack_from("<Q", head, 8)[0] == stats["footer_offset"]
-    assert struct.unpack_from("<Q", head, 16)[0] == stats["footer_size"]
-    # footer_offset + footer_size == file size (footer is the very tail).
-    assert stats["footer_offset"] + stats["footer_size"] == out.stat().st_size
+    raw = out.read_bytes()
+    # Output starts with ISTL1 magic. The remaining 72 bytes of the 80-byte
+    # STL header are reserved (zeroed) — the footer pointer is at the tail.
+    assert raw[:8] == b"ISTL1\x00\x00\x00"
+    assert all(b == 0 for b in raw[8:80])
+    # Last 16 bytes = footer_size (u64 LE) + TRAILER magic.
+    tail_size, tail_magic = struct.unpack_from("<Q8s", raw, len(raw) - 16)
+    assert tail_magic == b"ISTLEND\x00"
+    assert tail_size == stats["footer_size"]
+    # footer_offset + footer_size + 16-B tail == file size.
+    assert stats["footer_offset"] + stats["footer_size"] + 16 == out.stat().st_size
     # The triangle count field (bytes 80..84) is still correct, so meshio
     # treats it as a plain binary STL.
     assert _stl_triangle_count(out) == 500

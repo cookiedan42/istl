@@ -1,12 +1,10 @@
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use crate::format::{
-    bbox_intersects, parse_istl_header, Index, RowGroup, STL_HEADER_LEN,
-};
+use crate::format::{Bbox, Index, RowGroup, STL_HEADER_LEN, TAIL_LEN, parse_istl_header, parse_tail};
 
 #[derive(Debug, Clone, Copy)]
 pub struct QueryStats {
@@ -25,53 +23,95 @@ pub struct Reader {
 impl Reader {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut file = File::open(path.as_ref())?;
+        let file_len = file.metadata()?.len();
+
+        // Sanity: header magic. We still validate the head magic so corrupted
+        // files or non-istl inputs fail fast with a meaningful error.
         let mut header = [0u8; STL_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let info = parse_istl_header(&header).ok_or_else(|| {
-            io::Error::new(
+        if !parse_istl_header(&header) {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "file does not start with ISTL magic",
-            )
-        })?;
+            ));
+        }
         let mut count_buf = [0u8; 4];
         file.read_exact(&mut count_buf)?;
         let triangle_count = u32::from_le_bytes(count_buf);
-        file.seek(SeekFrom::Start(info.footer_offset))?;
-        let mut footer_reader = std::io::BufReader::new(&file);
-        let index = Index::decode(&mut footer_reader)?;
-        // Sanity-check the recorded footer_size against the actually-encoded
-        // index size. Mismatch ⇒ either a corrupted file or a stale writer.
-        let encoded = index.encoded_size();
-        if info.footer_size != encoded {
+
+        // Footer is self-locating from the tail (Parquet-style):
+        //   last 8 B = TRAILER magic; preceding 8 B = footer_size (u64 LE).
+        if file_len < (STL_HEADER_LEN + 4 + TAIL_LEN) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file too short to contain header + tail",
+            ));
+        }
+        let mut tail = [0u8; TAIL_LEN];
+        file.seek(SeekFrom::Start(file_len - TAIL_LEN as u64))?;
+        file.read_exact(&mut tail)?;
+        let footer_size = parse_tail(&tail).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing ISTL trailer at end of file",
+            )
+        })?;
+
+        // Footer payload sits immediately before the tail.
+        let footer_offset = file_len
+            .checked_sub(TAIL_LEN as u64 + footer_size)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "footer_size larger than file",
+                )
+            })?;
+        if footer_offset < (STL_HEADER_LEN + 4) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "footer would overlap header",
+            ));
+        }
+
+        // Read the footer payload in one shot, then decode in memory. This is
+        // both faster on local disk (one large read) and the canonical pattern
+        // for the remote case (one range request).
+        let mut payload = vec![0u8; footer_size as usize];
+        read_exact_at(&file, &mut payload, footer_offset)?;
+        let index = Index::decode(&mut Cursor::new(&payload))?;
+        if index.encoded_size() != footer_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "footer_size in header ({}) disagrees with decoded index size ({})",
-                    info.footer_size, encoded
+                    "tail footer_size ({}) disagrees with decoded index size ({})",
+                    footer_size,
+                    index.encoded_size()
                 ),
             ));
         }
+
         Ok(Reader {
             file,
             index,
-            footer_offset: info.footer_offset,
-            footer_size: info.footer_size,
+            footer_offset,
+            footer_size,
             triangle_count,
         })
     }
 
     /// Write a vanilla binary STL containing every triangle from every row group
-    /// whose bbox intersects the query bbox `[xmin, xmax, ymin, ymax, zmin, zmax]`.
+    /// whose bbox intersects `query_bbox`. Use `Bbox::UNIVERSE` (or `±∞` on any
+    /// axis) to disable filtering on that axis.
     pub fn query<P: AsRef<Path>>(
         &self,
-        query_bbox: &[f32; 6],
+        query_bbox: &Bbox,
         out_path: P,
     ) -> io::Result<QueryStats> {
         let matched: Vec<&RowGroup> = self
             .index
             .groups
             .iter()
-            .filter(|g| bbox_intersects(&g.bbox, query_bbox))
+            .filter(|g| g.bbox.intersects(query_bbox))
             .collect();
 
         let triangles_written: u64 = matched.iter().map(|g| g.triangle_count()).sum();
@@ -124,4 +164,3 @@ fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     f.seek(SeekFrom::Start(offset))?;
     f.read_exact(buf)
 }
-

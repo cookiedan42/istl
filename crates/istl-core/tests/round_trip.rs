@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use istl_core::{convert, Reader, STL_HEADER_LEN, TRI_SIZE};
+use istl_core::{Bbox, Reader, STL_HEADER_LEN, TRI_SIZE, convert};
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("istl-test-{name}-{}", std::process::id()));
@@ -55,15 +55,14 @@ fn convert_then_size_invariants() {
     assert_eq!(reader.index.groups.len() as u64, stats.groups);
     let sum_sizes: u64 = reader.index.groups.iter().map(|g| g.byte_size).sum();
     assert_eq!(sum_sizes, n as u64 * TRI_SIZE as u64);
-    // footer_size in the header must equal the encoded index size, and the
-    // total file size must equal header + count + triangles + footer.
+    // footer_size from the tail must equal the encoded index size, and the
+    // total file size must equal header + count + triangles + footer + 16-B tail.
     assert_eq!(reader.footer_size, reader.index.encoded_size());
     assert_eq!(stats.footer_size, reader.footer_size);
-    let expected_size =
-        STL_HEADER_LEN as u64 + 4 + sum_sizes + reader.footer_size;
+    let expected_size = STL_HEADER_LEN as u64 + 4 + sum_sizes + reader.footer_size + 16;
     assert_eq!(file_size, expected_size);
-    // footer_offset + footer_size must hit the end of the file exactly.
-    assert_eq!(reader.footer_offset + reader.footer_size, file_size);
+    // footer_offset + footer_size + tail must hit the end of the file exactly.
+    assert_eq!(reader.footer_offset + reader.footer_size + 16, file_size);
     // groups are contiguous starting at 84
     let mut cur = (STL_HEADER_LEN + 4) as u64;
     for g in &reader.index.groups {
@@ -85,29 +84,21 @@ fn query_subset_and_full() {
     let reader = Reader::open(&istl).unwrap();
 
     // Full-volume query returns everything
-    let inf_box = [
-        f32::NEG_INFINITY,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::INFINITY,
-    ];
     let out_all = dir.join("all.stl");
-    let s = reader.query(&inf_box, &out_all).unwrap();
+    let s = reader.query(&Bbox::UNIVERSE, &out_all).unwrap();
     assert_eq!(s.triangles_written, n as u64);
     let bytes = fs::read(&out_all).unwrap();
-    assert_eq!(
-        bytes.len(),
-        STL_HEADER_LEN + 4 + n as usize * TRI_SIZE
+    assert_eq!(bytes.len(), STL_HEADER_LEN + 4 + n as usize * TRI_SIZE);
+    let count_in_file = u32::from_le_bytes(
+        bytes[STL_HEADER_LEN..STL_HEADER_LEN + 4]
+            .try_into()
+            .unwrap(),
     );
-    let count_in_file =
-        u32::from_le_bytes(bytes[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap());
     assert_eq!(count_in_file, n);
 
     // Tight bbox should return only some groups (whole-row-group behavior).
     // Pick a 4×4 window in xy.
-    let tight = [3.0, 6.0, 3.0, 6.0, -1.0, 1.0];
+    let tight = Bbox::from([3.0, 6.0, 3.0, 6.0, -1.0, 1.0]);
     let out_tight = dir.join("tight.stl");
     let s = reader.query(&tight, &out_tight).unwrap();
     assert!(s.groups_matched > 0);
@@ -115,15 +106,18 @@ fn query_subset_and_full() {
     assert!(s.triangles_written <= n as u64);
 
     // Far-away bbox returns nothing.
-    let far = [1e9, 2e9, 1e9, 2e9, 0.0, 1.0];
+    let far = Bbox::from([1e9, 2e9, 1e9, 2e9, 0.0, 1.0]);
     let out_far = dir.join("far.stl");
     let s = reader.query(&far, &out_far).unwrap();
     assert_eq!(s.groups_matched, 0);
     assert_eq!(s.triangles_written, 0);
     let bytes = fs::read(&out_far).unwrap();
     assert_eq!(bytes.len(), STL_HEADER_LEN + 4);
-    let cnt =
-        u32::from_le_bytes(bytes[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap());
+    let cnt = u32::from_le_bytes(
+        bytes[STL_HEADER_LEN..STL_HEADER_LEN + 4]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(cnt, 0);
 }
 
@@ -140,7 +134,7 @@ fn brute_force_subset_check() {
     convert(&stl, &istl, 32).unwrap();
     let reader = Reader::open(&istl).unwrap();
 
-    let qb = [5.0, 10.0, 5.0, 10.0, -1.0, 1.0];
+    let qb = Bbox::from([5.0, 10.0, 5.0, 10.0, -1.0, 1.0]);
     let out = dir.join("q.stl");
     let stats = reader.query(&qb, &out).unwrap();
 
@@ -151,7 +145,7 @@ fn brute_force_subset_check() {
         let off = STL_HEADER_LEN + 4 + i * TRI_SIZE;
         let x = f32::from_le_bytes(raw[off + 12..off + 16].try_into().unwrap());
         let y = f32::from_le_bytes(raw[off + 16..off + 20].try_into().unwrap());
-        if x >= qb[0] && x <= qb[1] && y >= qb[2] && y <= qb[3] {
+        if x >= qb.xmin && x <= qb.xmax && y >= qb.ymin && y <= qb.ymax {
             expected_in += 1;
         }
     }

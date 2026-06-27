@@ -1,18 +1,21 @@
+//! Convert a plain binary STL to an indexed binary STL.
+
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::format::{make_istl_header, Index, RowGroup, MAGIC, STL_HEADER_LEN, TRI_SIZE};
+use crate::format::{
+    Bbox, Index, MAGIC, RowGroup, STL_HEADER_LEN, TRI_SIZE, make_istl_header, make_tail,
+};
 use crate::hilbert;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConvertStats {
     pub triangles: u64,
     pub groups: u64,
-    /// [xmin, xmax, ymin, ymax, zmin, zmax]
-    pub dataset_bbox: [f32; 6],
+    pub dataset_bbox: Bbox,
     pub footer_offset: u64,
     pub footer_size: u64,
 }
@@ -25,6 +28,23 @@ fn read_f32(b: &[u8]) -> f32 {
 /// Hilbert grid side = 2^16. Anything finer doesn't fit in a u32 key.
 const HILBERT_ORDER: u32 = 16;
 const HILBERT_SIDE: u32 = 1u32 << HILBERT_ORDER;
+
+/// Default triangles per row group.
+///
+/// At 50 B/triangle this is ~1.6 MB per group, which sits at the start of the
+/// efficient parallel-range-GET band for object stores (S3, GCS, Azure Blob),
+/// while keeping the footer small enough (~2 KB per 1,000 groups) to fit in a
+/// single ~64-96 KB speculative tail GET. For terrain-scale data (~50 M
+/// triangles) this yields ~1.5 K groups and a ~60 KB footer.
+///
+/// Tune per deployment:
+/// - Local NVMe / mmap'd reads: 8,192 (smaller, tighter bboxes).
+/// - HDD / NFS / EFS: 131,072+ (fewer seeks).
+/// - High-latency edge / generic HTTP: 131,072+ (overhead dominates).
+/// - S3 Express One Zone: 16,384 (lower TTFB pays back smaller groups).
+///
+/// The format itself doesn't care about this number — it's a writer-side knob.
+pub const DEFAULT_GROUP_SIZE: usize = 32_768;
 
 pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     input: P,
@@ -54,29 +74,22 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     // Pass 1: stream every triangle, collect first-vertex XY for the sort key,
     // and accumulate the full dataset bbox over all 3 vertices.
     let mut first_xy: Vec<(f32, f32)> = Vec::with_capacity(n_triangles);
-    let mut bbox = [
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-    ];
+    let mut bbox = Bbox::EMPTY;
 
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
     let mut tri = [0u8; TRI_SIZE];
     for _ in 0..n_triangles {
         reader.read_exact(&mut tri)?;
         first_xy.push((read_f32(&tri[12..16]), read_f32(&tri[16..20])));
-        fold_bbox(&mut bbox, &tri);
+        fold_triangle(&mut bbox, &tri);
     }
     drop(reader);
 
     // Build sort keys and free the (x,y) buffer.
     let mut keys: Vec<(u32, u32)> = Vec::with_capacity(n_triangles);
     for (i, &(x, y)) in first_xy.iter().enumerate() {
-        let qx = hilbert::normalize(x, bbox[0], bbox[1], HILBERT_SIDE);
-        let qy = hilbert::normalize(y, bbox[2], bbox[3], HILBERT_SIDE);
+        let qx = hilbert::normalize(x, bbox.xmin, bbox.xmax, HILBERT_SIDE);
+        let qy = hilbert::normalize(y, bbox.ymin, bbox.ymax, HILBERT_SIDE);
         keys.push((hilbert::xy2d(HILBERT_ORDER, qx, qy), i as u32));
     }
     drop(first_xy);
@@ -87,8 +100,8 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     let out_file = File::create(output.as_ref())?;
     let mut out = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
 
-    // Placeholder header — footer_offset / footer_size patched in at the end.
-    out.write_all(&make_istl_header(0, 0))?;
+    // Header is magic only — footer is self-locating from the tail.
+    out.write_all(&make_istl_header())?;
     out.write_all(&(n_triangles as u32).to_le_bytes())?;
     let mut cur_offset: u64 = (STL_HEADER_LEN + 4) as u64;
 
@@ -97,18 +110,11 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
 
     for chunk in keys.chunks(group_size) {
         let byte_start = cur_offset;
-        let mut g_bbox = [
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ];
+        let mut g_bbox = Bbox::EMPTY;
         for &(_, idx) in chunk {
             let src_off = (STL_HEADER_LEN + 4) as u64 + (idx as u64) * TRI_SIZE as u64;
             read_exact_at(&in_file, &mut buf, src_off)?;
-            fold_bbox(&mut g_bbox, &buf);
+            fold_triangle(&mut g_bbox, &buf);
             out.write_all(&buf)?;
         }
         let byte_size = chunk.len() as u64 * TRI_SIZE as u64;
@@ -125,14 +131,8 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     let group_count = index.groups.len() as u64;
     let footer_size = index.encoded_size();
     index.encode(&mut out)?;
+    out.write_all(&make_tail(footer_size))?;
     out.flush()?;
-
-    // Patch footer_offset (8..16) and footer_size (16..24) into the header.
-    let mut out_file = out.into_inner().map_err(|e| e.into_error())?;
-    out_file.seek(SeekFrom::Start(8))?;
-    out_file.write_all(&footer_offset.to_le_bytes())?;
-    out_file.write_all(&footer_size.to_le_bytes())?;
-    out_file.flush()?;
 
     Ok(ConvertStats {
         triangles: n_triangles as u64,
@@ -143,30 +143,14 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     })
 }
 
-fn fold_bbox(bbox: &mut [f32; 6], tri: &[u8; TRI_SIZE]) {
+/// Fold all 3 vertices of a binary-STL triangle record into `bbox`.
+fn fold_triangle(bbox: &mut Bbox, tri: &[u8; TRI_SIZE]) {
     for v in 0..3 {
         let off = 12 + v * 12;
         let vx = read_f32(&tri[off..off + 4]);
         let vy = read_f32(&tri[off + 4..off + 8]);
         let vz = read_f32(&tri[off + 8..off + 12]);
-        if vx < bbox[0] {
-            bbox[0] = vx;
-        }
-        if vx > bbox[1] {
-            bbox[1] = vx;
-        }
-        if vy < bbox[2] {
-            bbox[2] = vy;
-        }
-        if vy > bbox[3] {
-            bbox[3] = vy;
-        }
-        if vz < bbox[4] {
-            bbox[4] = vz;
-        }
-        if vz > bbox[5] {
-            bbox[5] = vz;
-        }
+        bbox.fold_point(vx, vy, vz);
     }
 }
 

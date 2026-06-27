@@ -7,7 +7,7 @@ fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 #[pyfunction]
-#[pyo3(signature = (input, output, group_size=8192))]
+#[pyo3(signature = (input, output, group_size=istl_core::DEFAULT_GROUP_SIZE))]
 fn convert<'py>(
     py: Python<'py>,
     input: &str,
@@ -22,17 +22,8 @@ fn convert<'py>(
     d.set_item("groups", stats.groups)?;
     d.set_item("footer_offset", stats.footer_offset)?;
     d.set_item("footer_size", stats.footer_size)?;
-    d.set_item(
-        "dataset_bbox",
-        (
-            stats.dataset_bbox[0],
-            stats.dataset_bbox[1],
-            stats.dataset_bbox[2],
-            stats.dataset_bbox[3],
-            stats.dataset_bbox[4],
-            stats.dataset_bbox[5],
-        ),
-    )?;
+    let b = stats.dataset_bbox;
+    d.set_item("dataset_bbox", (b.xmin, b.xmax, b.ymin, b.ymax, b.zmin, b.zmax))?;
     Ok(d)
 }
 
@@ -50,7 +41,14 @@ fn query<'py>(
             "bbox has min > max on at least one axis",
         ));
     }
-    let q = [xmin, xmax, ymin, ymax, zmin, zmax];
+    let q = istl_core::Bbox {
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
+    };
     let stats = py
         .detach(|| {
             let reader = istl_core::Reader::open(input)?;
@@ -71,12 +69,12 @@ fn read_index<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyList>> 
         let d = PyDict::new(py);
         d.set_item("byte_start", g.byte_start)?;
         d.set_item("byte_size", g.byte_size)?;
-        d.set_item("xmin", g.bbox[0])?;
-        d.set_item("xmax", g.bbox[1])?;
-        d.set_item("ymin", g.bbox[2])?;
-        d.set_item("ymax", g.bbox[3])?;
-        d.set_item("zmin", g.bbox[4])?;
-        d.set_item("zmax", g.bbox[5])?;
+        d.set_item("xmin", g.bbox.xmin)?;
+        d.set_item("xmax", g.bbox.xmax)?;
+        d.set_item("ymin", g.bbox.ymin)?;
+        d.set_item("ymax", g.bbox.ymax)?;
+        d.set_item("zmin", g.bbox.zmin)?;
+        d.set_item("zmax", g.bbox.zmax)?;
         out.append(d)?;
     }
     Ok(out)
@@ -87,5 +85,6 @@ fn istl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(read_index, m)?)?;
+    m.add("DEFAULT_GROUP_SIZE", istl_core::DEFAULT_GROUP_SIZE)?;
     Ok(())
 }

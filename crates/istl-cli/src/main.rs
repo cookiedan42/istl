@@ -1,8 +1,10 @@
+//! Command-line interface to the `istl` crate.
+
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use istl_core::{convert, Reader};
+use istl_core::{Bbox, DEFAULT_GROUP_SIZE, Reader, convert};
 
 #[derive(Parser)]
 #[command(name = "istl", version, about = "Indexed STL converter and reader")]
@@ -14,10 +16,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Convert a plain binary STL to a Hilbert-sorted indexed .istl file.
+    ///
+    /// `--group-size` controls triangles per row group. Default (32,768) targets
+    /// object-store access (S3/GCS/Azure) — ~1.6 MB per group, footer fits a
+    /// ~64 KB tail GET. Lower (8,192) is better for local NVMe / tight AOIs;
+    /// higher (131,072+) for HDD/NFS or generic HTTP servers.
     Convert {
         input: PathBuf,
         output: PathBuf,
-        #[arg(long, default_value_t = 8192)]
+        #[arg(long, default_value_t = DEFAULT_GROUP_SIZE)]
         group_size: usize,
     },
     /// Query an .istl file with a 3D bbox and emit a plain binary STL.
@@ -26,7 +33,7 @@ enum Cmd {
         input: PathBuf,
         output: PathBuf,
         #[arg(long, value_parser = parse_bbox)]
-        bbox: [f32; 6],
+        bbox: Bbox,
     },
     /// Print summary info about an .istl file's footer.
     Info {
@@ -36,9 +43,8 @@ enum Cmd {
     },
 }
 
-/// Parses "xmin,ymin,zmin,xmax,ymax,zmax" into the canonical bbox6 order
-/// [xmin, xmax, ymin, ymax, zmin, zmax] used internally.
-fn parse_bbox(s: &str) -> Result<[f32; 6], String> {
+/// Parses "xmin,ymin,zmin,xmax,ymax,zmax" into a `Bbox`.
+fn parse_bbox(s: &str) -> Result<Bbox, String> {
     let parts: Vec<&str> = s.split(',').map(str::trim).collect();
     if parts.len() != 6 {
         return Err(format!(
@@ -54,7 +60,14 @@ fn parse_bbox(s: &str) -> Result<[f32; 6], String> {
     if !(xmin <= xmax && ymin <= ymax && zmin <= zmax) {
         return Err("bbox min > max on at least one axis".into());
     }
-    Ok([xmin, xmax, ymin, ymax, zmin, zmax])
+    Ok(Bbox {
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
+    })
 }
 
 fn main() -> Result<()> {
@@ -67,11 +80,19 @@ fn main() -> Result<()> {
         } => {
             let stats = convert(&input, &output, group_size)
                 .with_context(|| format!("converting {:?} -> {:?}", input, output))?;
+            let b = stats.dataset_bbox;
             println!(
-                "converted: triangles={} groups={} dataset_bbox=[{:?}] footer_offset={} footer_size={}",
+                "converted: triangles={} groups={} \
+                 dataset_bbox=x[{:.3}..{:.3}] y[{:.3}..{:.3}] z[{:.3}..{:.3}] \
+                 footer_offset={} footer_size={}",
                 stats.triangles,
                 stats.groups,
-                stats.dataset_bbox,
+                b.xmin,
+                b.xmax,
+                b.ymin,
+                b.ymax,
+                b.zmin,
+                b.zmax,
                 stats.footer_offset,
                 stats.footer_size,
             );
@@ -96,23 +117,10 @@ fn main() -> Result<()> {
             if groups.is_empty() {
                 return Err(anyhow!("index is empty"));
             }
-            let mut ds = [
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-            ];
+            let mut ds = Bbox::EMPTY;
             for g in groups {
-                for axis in 0..3 {
-                    if g.bbox[axis * 2] < ds[axis * 2] {
-                        ds[axis * 2] = g.bbox[axis * 2];
-                    }
-                    if g.bbox[axis * 2 + 1] > ds[axis * 2 + 1] {
-                        ds[axis * 2 + 1] = g.bbox[axis * 2 + 1];
-                    }
-                }
+                ds.fold_point(g.bbox.xmin, g.bbox.ymin, g.bbox.zmin);
+                ds.fold_point(g.bbox.xmax, g.bbox.ymax, g.bbox.zmax);
             }
             println!(
                 "footer_offset={} footer_size={} triangle_count={} groups={}",
@@ -123,7 +131,7 @@ fn main() -> Result<()> {
             );
             println!(
                 "dataset_bbox: x[{:.3}..{:.3}] y[{:.3}..{:.3}] z[{:.3}..{:.3}]",
-                ds[0], ds[1], ds[2], ds[3], ds[4], ds[5]
+                ds.xmin, ds.xmax, ds.ymin, ds.ymax, ds.zmin, ds.zmax,
             );
             for (i, g) in groups.iter().take(sample).enumerate() {
                 println!(
@@ -131,7 +139,12 @@ fn main() -> Result<()> {
                     g.byte_start,
                     g.byte_size,
                     g.triangle_count(),
-                    g.bbox[0], g.bbox[1], g.bbox[2], g.bbox[3], g.bbox[4], g.bbox[5],
+                    g.bbox.xmin,
+                    g.bbox.xmax,
+                    g.bbox.ymin,
+                    g.bbox.ymax,
+                    g.bbox.zmin,
+                    g.bbox.zmax,
                 );
             }
         }

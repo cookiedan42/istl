@@ -2,8 +2,6 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::format::{
@@ -107,7 +105,12 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut cur_offset: u64 = (STL_HEADER_LEN + 4) as u64;
 
     let mut groups: Vec<RowGroup> = Vec::with_capacity(n_triangles.div_ceil(group_size));
-    let mut buf = [0u8; TRI_SIZE];
+
+    // On Unix we mmap the input read-only and slice triangles out directly:
+    // the kernel handles readahead via page faults, so the sorted-random-read
+    // inner loop becomes ~50M memcpy(50)+writes instead of ~50M pread syscalls.
+    // On other platforms we fall back to per-triangle pread/seek.
+    let mut src = TriangleSource::open(&in_file)?;
 
     // write triangles and build groups
     for chunk in keys.chunks(group_size) {
@@ -116,10 +119,10 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         for &(_, idx) in chunk {
             let src_off = (STL_HEADER_LEN + 4) as u64 + (idx as u64) * TRI_SIZE as u64;
 
-            read_exact_at(&in_file, &mut buf, src_off)?;
-            let tri = Triangle::ref_from(&buf);
+            let buf = src.read(src_off)?;
+            let tri = Triangle::ref_from(buf);
             tri.fold_triangle(&mut g_bbox);
-            out.write_all(&buf)?;
+            out.write_all(buf)?;
         }
         let byte_size = chunk.len() as u64 * TRI_SIZE as u64;
         cur_offset += byte_size;
@@ -129,6 +132,7 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
             bbox: g_bbox,
         });
     }
+    drop(src);
 
     let footer_offset = cur_offset;
     let index = Index { groups };
@@ -149,15 +153,65 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     })
 }
 
+/// Random-access reader of fixed-size triangle records.
+///
+/// Unix: backed by a read-only mmap of the input — the inner pass-2 loop
+/// slices triangles straight out of the mapping with no syscall per read.
+/// Other platforms: falls back to a single owned scratch buffer + seek/read.
 #[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    f.read_exact_at(buf, offset)
+struct TriangleSource {
+    map: memmap2::Mmap,
+}
+
+#[cfg(unix)]
+impl TriangleSource {
+    fn open(f: &File) -> io::Result<Self> {
+        // SAFETY: the input file is opened read-only by the converter and not
+        // mutated by us; concurrent external truncation/modification would
+        // produce torn reads but not memory unsafety beyond what any mmap of a
+        // shared file already implies.
+        let map = unsafe { memmap2::Mmap::map(f)? };
+        // Hint sequential-ish access; the keys are sorted by Hilbert curve so
+        // accesses are spatially local even though offsets are technically random.
+        #[cfg(target_os = "linux")]
+        let _ = map.advise(memmap2::Advice::WillNeed);
+        Ok(Self { map })
+    }
+
+    #[inline]
+    fn read(&mut self, offset: u64) -> io::Result<&[u8; TRI_SIZE]> {
+        let off = offset as usize;
+        let end = off + TRI_SIZE;
+        if end > self.map.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("triangle at offset {offset} runs past mmap end"),
+            ));
+        }
+        Ok(<&[u8; TRI_SIZE]>::try_from(&self.map[off..end]).unwrap())
+    }
 }
 
 #[cfg(not(unix))]
-fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = f;
-    f.seek(SeekFrom::Start(offset))?;
-    f.read_exact(buf)
+struct TriangleSource<'f> {
+    file: &'f File,
+    buf: [u8; TRI_SIZE],
+}
+
+#[cfg(not(unix))]
+impl<'f> TriangleSource<'f> {
+    fn open(f: &'f File) -> io::Result<Self> {
+        Ok(Self {
+            file: f,
+            buf: [0u8; TRI_SIZE],
+        })
+    }
+
+    fn read(&mut self, offset: u64) -> io::Result<&[u8; TRI_SIZE]> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = self.file;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(&mut self.buf)?;
+        Ok(&self.buf)
+    }
 }

@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 bytemuck = "1.25.0"
+
+[target.'cfg(unix)'.dependencies]
+memmap2 = "0.9"

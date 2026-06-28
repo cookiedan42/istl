@@ -183,7 +183,7 @@ file on S3.
 ## On-disk format (summary)
 
 ```
-bytes  0..8   : MAGIC "ISTL1\0\0\0"
+bytes  0..8   : IDENTIFIER "ISTL1\0\0\0"
 bytes  8..80  : reserved (zeroed, 72 B)
 bytes 80..84  : triangle_count u32 LE     ← valid plain-STL count
 bytes 84..    : triangles (50 B each, Hilbert-sorted)
@@ -194,19 +194,19 @@ last 16 B     : footer_size u64 LE + TRAILER "ISTLEND\0"
 ```
 
 The footer is **self-locating from the tail** (the same pattern Parquet uses):
-a reader looks at the last 16 bytes to find the trailer magic and
+a reader looks at the last 16 bytes to find the trailer identifier and
 `footer_size`, then reads `footer_size` bytes immediately before the tail to
 get the index. Invariant: `file_size = 84 + 50 × triangle_count + footer_size + 16`.
 
 This makes the format friendly to range-GET access on S3: one speculative
 `GET Range: bytes=-N` (e.g. `N = 64 KB`) typically retrieves the trailer
-magic, `footer_size`, and the entire footer in a single round trip. Once the
+identifier, `footer_size`, and the entire footer in a single round trip. Once the
 index is in hand, follow-up GETs fetch only the matching row-group slabs.
 
 Because the format keeps the original binary-STL header structure (just with
-magic in the unused-by-spec first bytes), the file remains parseable by any
+identifier in the unused-by-spec first bytes), the file remains parseable by any
 strict binary-STL reader. Some readers (e.g. `meshio`) auto-detect ASCII vs
-binary by UTF-8-decoding the first few bytes and will trip on the magic —
+binary by UTF-8-decoding the first few bytes and will trip on the identifier —
 that's a reader quirk, not a format violation.
 
 ## License

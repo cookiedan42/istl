@@ -19,11 +19,11 @@ def test_convert_round_trip(tmp_stl, tmp_path):
     assert stats["triangles"] == 500
     assert stats["groups"] == math.ceil(500 / 32)
     raw = out.read_bytes()
-    # Output starts with ISTL1 magic. The remaining 72 bytes of the 80-byte
+    # Output starts with ISTL1 identifier. The remaining 72 bytes of the 80-byte
     # STL header are reserved (zeroed) — the footer pointer is at the tail.
     assert raw[:8] == b"ISTL1\x00\x00\x00"
     assert all(b == 0 for b in raw[8:80])
-    # Last 16 bytes = footer_size (u64 LE) + TRAILER magic.
+    # Last 16 bytes = footer_size (u64 LE) + TRAILER identifier.
     tail_size, tail_magic = struct.unpack_from("<Q8s", raw, len(raw) - 16)
     assert tail_magic == b"ISTLEND\x00"
     assert tail_size == stats["footer_size"]
@@ -142,7 +142,7 @@ def test_query_format_default_is_stl(tmp_stl, tmp_path):
         bbox=(0.0, 0.0, -1.0, 10.0, 10.0, 1.0),
     )
     raw = sliced.read_bytes()
-    # Vanilla binary STL: 80-byte zero header (no ISTL magic).
+    # Vanilla binary STL: 80-byte zero header (no ISTL identifier).
     assert raw[:8] != b"ISTL1\x00\x00\x00"
     # No ISTLEND trailer.
     assert raw[-8:] != b"ISTLEND\x00"

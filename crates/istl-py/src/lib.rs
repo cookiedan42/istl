@@ -8,6 +8,9 @@ use pyo3::types::{PyDict, PyList};
 
 use istl_core::QueryStats;
 
+mod converter;
+pub use converter::convert;
+
 fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyIOError::new_err(e.to_string())
 }
@@ -136,9 +139,9 @@ where
             let mut buf = BufWriter::with_capacity(8 * 1024 * 1024, sink);
             let stats = f(&mut buf)?;
             buf.flush()?;
-            let sink = buf.into_inner().map_err(|e| {
-                io::Error::other(format!("flushing sink for {url:?}: {e}"))
-            })?;
+            let sink = buf
+                .into_inner()
+                .map_err(|e| io::Error::other(format!("flushing sink for {url:?}: {e}")))?;
             sink.finish()?;
             Ok(stats)
         }
@@ -147,27 +150,6 @@ where
             "URL output {url:?} requires the `remote` feature"
         ))),
     }
-}
-
-#[pyfunction]
-#[pyo3(signature = (input, output, group_size=istl_core::DEFAULT_GROUP_SIZE))]
-fn convert<'py>(
-    py: Python<'py>,
-    input: &str,
-    output: &str,
-    group_size: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let stats = py
-        .detach(|| istl_core::convert(input, output, group_size))
-        .map_err(io_err)?;
-    let d = PyDict::new(py);
-    d.set_item("triangles", stats.triangles)?;
-    d.set_item("groups", stats.groups)?;
-    d.set_item("footer_offset", stats.footer_offset)?;
-    d.set_item("footer_size", stats.footer_size)?;
-    let b = stats.dataset_bbox;
-    d.set_item("dataset_bbox", (b.xmin, b.xmax, b.ymin, b.ymax, b.zmin, b.zmax))?;
-    Ok(d)
 }
 
 /// Query an .istl file with a 3D bbox and write the result.

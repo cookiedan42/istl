@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::{self, BufWriter, Cursor, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use crate::format::{
-    Bbox, Index, RowGroup, STL_HEADER_LEN, TAIL_LEN, make_istl_header, make_tail,
-    parse_istl_header, parse_tail,
+    Bbox, Index, IstlFormat, IstlTrait, MIN_ISTL_SIZE, RowGroup, STL_HEADER_LEN, StlFormat,
+    TAIL_LEN, make_tail, parse_istl_header, parse_tail,
 };
 use crate::source::{FileSource, RangeReader};
 
@@ -16,7 +16,7 @@ pub struct QueryStats {
 
 /// Reader over any [`RangeReader`] source — local file, S3, in-memory, …
 ///
-/// Construction reads the head magic (24 B) and the 16-byte tail to locate
+/// Construction reads the head identifier (24 B) and the 16-byte tail to locate
 /// the footer, then fetches the footer payload in one `read_at`. On S3 that's
 /// typically two range GETs (front + back); a client that already grabbed a
 /// speculative tail can construct a `BytesSource` over that buffer to skip the
@@ -27,6 +27,9 @@ pub struct Reader<R: RangeReader> {
     pub footer_offset: u64,
     pub footer_size: u64,
     pub triangle_count: u32,
+    /// Largest `byte_size` across all groups in `index`. Used to size the
+    /// per-query scratch buffer so it fits any single group exactly.
+    max_group_size: u64,
 }
 
 impl Reader<FileSource> {
@@ -41,28 +44,27 @@ impl<R: RangeReader> Reader<R> {
     /// Open a `Reader` over an arbitrary `RangeReader` source.
     pub fn open_source(source: R) -> io::Result<Self> {
         let file_len = source.len();
-        if file_len < (STL_HEADER_LEN + 4 + TAIL_LEN) as u64 {
+        if file_len < MIN_ISTL_SIZE as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "file too short to contain header + tail",
             ));
         }
 
-        // Header magic + STL triangle count (84 bytes from the front).
+        // Header identifier + STL triangle count (84 bytes from the front).
         let mut head = [0u8; STL_HEADER_LEN + 4];
         source.read_at(0, &mut head)?;
         if !parse_istl_header(&head[..STL_HEADER_LEN]) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "file does not start with ISTL magic",
+                "file does not start with ISTL identifier",
             ));
         }
-        let triangle_count = u32::from_le_bytes(
-            head[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap(),
-        );
+        let triangle_count =
+            u32::from_le_bytes(head[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap());
 
         // Footer is self-locating from the tail (Parquet-style):
-        //   last 8 B = TRAILER magic; preceding 8 B = footer_size (u64 LE).
+        //   last 8 B = TRAILER identifier; preceding 8 B = footer_size (u64 LE).
         let mut tail = [0u8; TAIL_LEN];
         source.read_at(file_len - TAIL_LEN as u64, &mut tail)?;
         let footer_size = parse_tail(&tail).ok_or_else(|| {
@@ -76,10 +78,7 @@ impl<R: RangeReader> Reader<R> {
         let footer_offset = file_len
             .checked_sub(TAIL_LEN as u64 + footer_size)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "footer_size larger than file",
-                )
+                io::Error::new(io::ErrorKind::InvalidData, "footer_size larger than file")
             })?;
         if footer_offset < (STL_HEADER_LEN + 4) as u64 {
             return Err(io::Error::new(
@@ -89,7 +88,7 @@ impl<R: RangeReader> Reader<R> {
         }
 
         let payload = source.read_vec(footer_offset, footer_size as usize)?;
-        let index = Index::decode(&mut Cursor::new(&payload))?;
+        let index = Index::decode(&payload)?;
         if index.encoded_size() != footer_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -101,12 +100,15 @@ impl<R: RangeReader> Reader<R> {
             ));
         }
 
+        let max_group_size = index.groups.iter().map(|g| g.byte_size).max().unwrap_or(0);
+
         Ok(Reader {
             source,
             index,
             footer_offset,
             footer_size,
             triangle_count,
+            max_group_size,
         })
     }
 
@@ -124,7 +126,10 @@ impl<R: RangeReader> Reader<R> {
             .filter(|g| g.bbox.intersects(query_bbox))
             .collect()
     }
+}
 
+// write methods
+impl<R: RangeReader> Reader<R> {
     /// Write a vanilla binary STL containing every triangle from every row group
     /// whose bbox intersects `query_bbox`, into the given `Write`.
     ///
@@ -136,17 +141,21 @@ impl<R: RangeReader> Reader<R> {
     ) -> io::Result<QueryStats> {
         let matched = self.matched_groups(query_bbox);
         let triangles_written: u64 = matched.iter().map(|g| g.triangle_count()).sum();
-        let tri_count_u32: u32 = triangles_written.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "result > 2^32 triangles")
-        })?;
+        let tri_count_u32: u32 = triangles_written
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "result > 2^32 triangles"))?;
 
-        // Plain 80-byte zero STL header — keeps the result a vanilla binary STL.
-        out.write_all(&[0u8; STL_HEADER_LEN])?;
+        out.write_all(StlFormat::HEADER)?;
         out.write_all(&tri_count_u32.to_le_bytes())?;
 
-        let mut buf = vec![0u8; 4 * 1024 * 1024];
-        for g in &matched {
-            self.stream_group(g, &mut buf, out)?;
+        if !matched.is_empty() {
+            let mut buf = vec![0u8; self.max_group_size as usize];
+
+            for g in &matched {
+                let slab = &mut buf[..g.byte_size as usize];
+                self.source.read_at(g.byte_start, slab)?;
+                out.write_all(slab)?;
+            }
         }
 
         Ok(QueryStats {
@@ -171,31 +180,41 @@ impl<R: RangeReader> Reader<R> {
     ) -> io::Result<QueryStats> {
         let matched = self.matched_groups(query_bbox);
         let triangles_written: u64 = matched.iter().map(|g| g.triangle_count()).sum();
-        let tri_count_u32: u32 = triangles_written.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "result > 2^32 triangles")
-        })?;
+        let tri_count_u32: u32 = triangles_written
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "result > 2^32 triangles"))?;
 
-        out.write_all(&make_istl_header())?;
+        out.write_all(IstlFormat::HEADER)?;
         out.write_all(&tri_count_u32.to_le_bytes())?;
 
-        let mut cur_offset: u64 = (STL_HEADER_LEN + 4) as u64;
+        let offset_head: u64 = (STL_HEADER_LEN + 4) as u64;
+
+        let mut cur_offset: u64 = offset_head;
+
         let mut groups: Vec<RowGroup> = Vec::with_capacity(matched.len());
-        let mut buf = vec![0u8; 4 * 1024 * 1024];
-        for g in &matched {
-            let byte_start = cur_offset;
-            self.stream_group(g, &mut buf, out)?;
-            cur_offset += g.byte_size;
-            groups.push(RowGroup {
-                byte_start,
-                byte_size: g.byte_size,
-                bbox: g.bbox,
-            });
+
+        if !matched.is_empty() {
+            let mut buf = vec![0u8; self.max_group_size as usize];
+
+            for g in &matched {
+                let byte_start = cur_offset;
+                let slab = &mut buf[..g.byte_size as usize];
+                self.source.read_at(g.byte_start, slab)?;
+                out.write_all(slab)?;
+
+                // added parts for istl
+                cur_offset += g.byte_size;
+                groups.push(RowGroup {
+                    byte_start,
+                    byte_size: g.byte_size,
+                    bbox: g.bbox,
+                });
+            }
         }
 
         debug_assert_eq!(
             cur_offset,
-            (STL_HEADER_LEN + 4) as u64
-                + matched.iter().map(|g| g.byte_size).sum::<u64>()
+            (STL_HEADER_LEN + 4) as u64 + matched.iter().map(|g| g.byte_size).sum::<u64>()
         );
 
         let index = Index { groups };
@@ -210,11 +229,7 @@ impl<R: RangeReader> Reader<R> {
     }
 
     /// Sugar: write the matched STL to a path on disk.
-    pub fn query<P: AsRef<Path>>(
-        &self,
-        query_bbox: &Bbox,
-        out_path: P,
-    ) -> io::Result<QueryStats> {
+    pub fn query<P: AsRef<Path>>(&self, query_bbox: &Bbox, out_path: P) -> io::Result<QueryStats> {
         let f = File::create(out_path.as_ref())?;
         let mut out = BufWriter::with_capacity(8 * 1024 * 1024, f);
         let stats = self.query_to_writer(query_bbox, &mut out)?;
@@ -234,29 +249,4 @@ impl<R: RangeReader> Reader<R> {
         out.flush()?;
         Ok(stats)
     }
-
-    /// Stream a single row group's triangle bytes from `self.source` into `out`,
-    /// reusing the caller's scratch `buf`.
-    fn stream_group<W: Write + ?Sized>(
-        &self,
-        g: &RowGroup,
-        buf: &mut [u8],
-        out: &mut W,
-    ) -> io::Result<()> {
-        let mut remaining = g.byte_size;
-        let mut offset = g.byte_start;
-        while remaining > 0 {
-            let n = remaining.min(buf.len() as u64) as usize;
-            self.source.read_at(offset, &mut buf[..n])?;
-            out.write_all(&buf[..n])?;
-            offset += n as u64;
-            remaining -= n as u64;
-        }
-        Ok(())
-    }
-}
-
-/// Convenience for callers that just want the index from a local file.
-pub fn read_index<P: AsRef<Path>>(path: P) -> io::Result<Index> {
-    Ok(Reader::open(path)?.index)
 }

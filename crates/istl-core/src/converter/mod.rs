@@ -7,7 +7,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::format::{
-    Bbox, Index, MAGIC, RowGroup, STL_HEADER_LEN, TRI_SIZE, make_istl_header, make_tail,
+    Bbox, Index, IstlFormat, IstlTrait, RowGroup, STL_HEADER_LEN, STL_NUM_TRIANGLES_SIZE, TRI_SIZE,
+    Triangle, make_tail, parse_istl_header,
 };
 use crate::hilbert;
 
@@ -20,14 +21,10 @@ pub struct ConvertStats {
     pub footer_size: u64,
 }
 
-#[inline]
-fn read_f32(b: &[u8]) -> f32 {
-    f32::from_le_bytes(b.try_into().expect("4-byte slice"))
-}
-
 /// Hilbert grid side = 2^16. Anything finer doesn't fit in a u32 key.
 const HILBERT_ORDER: u32 = 16;
 const HILBERT_SIDE: u32 = 1u32 << HILBERT_ORDER;
+const ONE_MB: usize = 1024 * 1024;
 
 /// Default triangles per row group.
 ///
@@ -46,6 +43,7 @@ const HILBERT_SIDE: u32 = 1u32 << HILBERT_ORDER;
 /// The format itself doesn't care about this number — it's a writer-side knob.
 pub const DEFAULT_GROUP_SIZE: usize = 32_768;
 
+/// Convert a plain binary STL to an indexed binary STL.
 pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     input: P,
     output: Q,
@@ -61,33 +59,36 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut in_file = File::open(input.as_ref())?;
     let mut header = [0u8; STL_HEADER_LEN];
     in_file.read_exact(&mut header)?;
-    if &header[0..8] == MAGIC {
+
+    if parse_istl_header(&header) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "input already starts with ISTL magic; refusing to double-convert",
+            "input already starts with ISTL identifier; refusing to double-convert",
         ));
     }
-    let mut count_buf = [0u8; 4];
+
+    let mut count_buf = [0u8; STL_NUM_TRIANGLES_SIZE];
     in_file.read_exact(&mut count_buf)?;
     let n_triangles = u32::from_le_bytes(count_buf) as usize;
 
     // Pass 1: stream every triangle, collect first-vertex XY for the sort key,
     // and accumulate the full dataset bbox over all 3 vertices.
-    let mut first_xy: Vec<(f32, f32)> = Vec::with_capacity(n_triangles);
+    let mut first_xy: Vec<[f32; 2]> = Vec::with_capacity(n_triangles);
     let mut bbox = Bbox::EMPTY;
 
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
+    let mut reader = BufReader::with_capacity(ONE_MB, in_file);
     let mut tri = [0u8; TRI_SIZE];
     for _ in 0..n_triangles {
         reader.read_exact(&mut tri)?;
-        first_xy.push((read_f32(&tri[12..16]), read_f32(&tri[16..20])));
-        fold_triangle(&mut bbox, &tri);
+        let tri = Triangle::ref_from(&tri);
+        first_xy.push(tri.first_xy());
+        tri.fold_triangle(&mut bbox);
     }
     drop(reader);
 
     // Build sort keys and free the (x,y) buffer.
     let mut keys: Vec<(u32, u32)> = Vec::with_capacity(n_triangles);
-    for (i, &(x, y)) in first_xy.iter().enumerate() {
+    for (i, &[x, y]) in first_xy.iter().enumerate() {
         let qx = hilbert::normalize(x, bbox.xmin, bbox.xmax, HILBERT_SIDE);
         let qy = hilbert::normalize(y, bbox.ymin, bbox.ymax, HILBERT_SIDE);
         keys.push((hilbert::xy2d(HILBERT_ORDER, qx, qy), i as u32));
@@ -98,23 +99,26 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     // Pass 2: random reads in sorted order, into a freshly-created output.
     let in_file = File::open(input.as_ref())?;
     let out_file = File::create(output.as_ref())?;
-    let mut out = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    let mut out = BufWriter::with_capacity(ONE_MB, out_file);
 
-    // Header is magic only — footer is self-locating from the tail.
-    out.write_all(&make_istl_header())?;
+    // Header is identifier only — footer is self-locating from the tail.
+    out.write_all(IstlFormat::HEADER)?;
     out.write_all(&(n_triangles as u32).to_le_bytes())?;
     let mut cur_offset: u64 = (STL_HEADER_LEN + 4) as u64;
 
     let mut groups: Vec<RowGroup> = Vec::with_capacity(n_triangles.div_ceil(group_size));
     let mut buf = [0u8; TRI_SIZE];
 
+    // write triangles and build groups
     for chunk in keys.chunks(group_size) {
         let byte_start = cur_offset;
         let mut g_bbox = Bbox::EMPTY;
         for &(_, idx) in chunk {
             let src_off = (STL_HEADER_LEN + 4) as u64 + (idx as u64) * TRI_SIZE as u64;
+
             read_exact_at(&in_file, &mut buf, src_off)?;
-            fold_triangle(&mut g_bbox, &buf);
+            let tri = Triangle::ref_from(&buf);
+            tri.fold_triangle(&mut g_bbox);
             out.write_all(&buf)?;
         }
         let byte_size = chunk.len() as u64 * TRI_SIZE as u64;
@@ -130,6 +134,8 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
     let index = Index { groups };
     let group_count = index.groups.len() as u64;
     let footer_size = index.encoded_size();
+
+    // write index and footer
     index.encode(&mut out)?;
     out.write_all(&make_tail(footer_size))?;
     out.flush()?;
@@ -141,17 +147,6 @@ pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         footer_offset,
         footer_size,
     })
-}
-
-/// Fold all 3 vertices of a binary-STL triangle record into `bbox`.
-fn fold_triangle(bbox: &mut Bbox, tri: &[u8; TRI_SIZE]) {
-    for v in 0..3 {
-        let off = 12 + v * 12;
-        let vx = read_f32(&tri[off..off + 4]);
-        let vy = read_f32(&tri[off + 4..off + 8]);
-        let vz = read_f32(&tri[off + 8..off + 12]);
-        bbox.fold_point(vx, vy, vz);
-    }
 }
 
 #[cfg(unix)]

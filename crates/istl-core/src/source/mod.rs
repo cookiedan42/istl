@@ -71,6 +71,23 @@ pub trait RangeReader {
         Ok(())
     }
 
+    /// Read up to `max_tail_bytes` from the end of the object in a single call
+    /// and return `(buf, total_object_size)`. The returned buffer's last byte
+    /// is the object's last byte; `buf.len()` may be less than `max_tail_bytes`
+    /// if the object is smaller than the hint.
+    ///
+    /// Remote backends should override this to issue an HTTP suffix range
+    /// (`Range: bytes=-N`) so a single round trip both fetches the tail bytes
+    /// and learns the object size — no separate HEAD. The default impl uses
+    /// `len()` + one `read_at`, which is what local-file / in-memory sources
+    /// want anyway.
+    fn prefetch_tail(&self, max_tail_bytes: u64) -> io::Result<(Vec<u8>, u64)> {
+        let len = self.len();
+        let n = max_tail_bytes.min(len);
+        let buf = self.read_vec(len - n, n as usize)?;
+        Ok((buf, len))
+    }
+
     /// Read every `(offset, byte_size)` range and write them to `out` in
     /// submission order — used by `Reader::query_to_writer` to dispatch all
     /// matched row-group reads in one trait call. The default impl is a serial

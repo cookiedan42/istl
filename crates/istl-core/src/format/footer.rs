@@ -42,6 +42,23 @@ impl Index {
     pub fn encoded_size(&self) -> u64 {
         4 + (self.groups.len() as u64) * RowGroup::record_size() as u64
     }
+
+    /// Sum of triangle counts across every row group. Lets `Reader::open_source`
+    /// skip reading the STL `triangle_count` at bytes 80..84.
+    pub fn triangle_count(&self) -> u64 {
+        self.groups.iter().map(|g| g.triangle_count()).sum()
+    }
+
+    /// `triangle_count()` narrowed to `u32`, the on-disk STL width. Errors if
+    /// the sum doesn't fit — would only happen on a corrupt index.
+    pub fn triangle_count_u32(&self) -> io::Result<u32> {
+        u32::try_from(self.triangle_count()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "row-group triangle count exceeds u32",
+            )
+        })
+    }
 }
 
 /// Parse the 16-byte tail. Returns `Some(footer_size)` if the trailer identifier matches.

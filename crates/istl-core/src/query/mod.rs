@@ -4,9 +4,17 @@ use std::path::Path;
 
 use crate::format::{
     Bbox, Index, IstlFormat, IstlTrait, MIN_ISTL_SIZE, RowGroup, STL_HEADER_LEN, StlFormat,
-    TAIL_LEN, make_tail, parse_istl_header, parse_tail,
+    TAIL_LEN, make_tail, parse_tail,
 };
 use crate::source::{FileSource, RangeReader};
+
+/// Default size of the speculative tail fetch issued by [`Reader::open_source`].
+///
+/// 64 KB is large enough that the entire footer payload fits in one round trip
+/// for any realistic file (1,632 row groups at the default `group_size = 32_768`
+/// → 66 KB footer; that's already ~54 M triangles). Smaller hints cost extra
+/// round trips on huge indexes; larger hints waste bandwidth on tiny ones.
+pub const DEFAULT_TAIL_HINT: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QueryStats {
@@ -16,11 +24,16 @@ pub struct QueryStats {
 
 /// Reader over any [`RangeReader`] source — local file, S3, in-memory, …
 ///
-/// Construction reads the head identifier (24 B) and the 16-byte tail to locate
-/// the footer, then fetches the footer payload in one `read_at`. On S3 that's
-/// typically two range GETs (front + back); a client that already grabbed a
-/// speculative tail can construct a `BytesSource` over that buffer to skip the
-/// second GET entirely.
+/// Construction issues one [`RangeReader::prefetch_tail`] for the last
+/// [`DEFAULT_TAIL_HINT`] bytes. The 16-byte trailer at the end of that buffer
+/// locates the footer; in the common case the footer payload already lives
+/// inside the same buffer and no further I/O is needed. Only when the footer
+/// is larger than the hint does construction issue a second precise `read_at`.
+///
+/// On S3-style backends that means one range GET to open (versus the previous
+/// HEAD + 3 GETs). The head identifier is no longer consulted at open — the
+/// trailer plus the `footer_size == index.encoded_size()` cross-check are what
+/// validate the file.
 pub struct Reader<R: RangeReader> {
     source: R,
     pub index: Index,
@@ -38,33 +51,35 @@ impl Reader<FileSource> {
 }
 
 impl<R: RangeReader> Reader<R> {
-    /// Open a `Reader` over an arbitrary `RangeReader` source.
+    /// Open a `Reader` over an arbitrary `RangeReader` source using the default
+    /// tail hint ([`DEFAULT_TAIL_HINT`]).
     pub fn open_source(source: R) -> io::Result<Self> {
-        let file_len = source.len();
+        Self::open_source_with_tail_hint(source, DEFAULT_TAIL_HINT)
+    }
+
+    /// `open_source` with a caller-chosen speculative-tail size. Useful for
+    /// callers that want to tune the trade-off (tiny files want a smaller
+    /// hint, very-large indexes want a bigger one to avoid the follow-up GET).
+    pub fn open_source_with_tail_hint(source: R, tail_hint: u64) -> io::Result<Self> {
+        let hint = tail_hint.max(TAIL_LEN as u64);
+        let (buf, file_len) = source.prefetch_tail(hint)?;
         if file_len < MIN_ISTL_SIZE as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "file too short to contain header + tail",
             ));
         }
-
-        // Header identifier + STL triangle count (84 bytes from the front).
-        let mut head = [0u8; STL_HEADER_LEN + 4];
-        source.read_at(0, &mut head)?;
-        if !parse_istl_header(&head[..STL_HEADER_LEN]) {
+        if (buf.len() as u64) < TAIL_LEN as u64 || (buf.len() as u64) > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "file does not start with ISTL identifier",
+                "prefetch_tail returned a buffer with an unexpected size",
             ));
         }
-        let triangle_count =
-            u32::from_le_bytes(head[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap());
 
         // Footer is self-locating from the tail (Parquet-style):
         //   last 8 B = TRAILER identifier; preceding 8 B = footer_size (u64 LE).
-        let mut tail = [0u8; TAIL_LEN];
-        source.read_at(file_len - TAIL_LEN as u64, &mut tail)?;
-        let footer_size = parse_tail(&tail).ok_or_else(|| {
+        let tail_start_in_buf = buf.len() - TAIL_LEN;
+        let footer_size = parse_tail(&buf[tail_start_in_buf..]).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "missing ISTL trailer at end of file",
@@ -84,7 +99,16 @@ impl<R: RangeReader> Reader<R> {
             ));
         }
 
-        let payload = source.read_vec(footer_offset, footer_size as usize)?;
+        // Common case: the speculative tail already covers the whole footer.
+        // Slice out of `buf`; fall back to one precise GET only if it doesn't.
+        let need = (footer_size as usize).saturating_add(TAIL_LEN);
+        let payload: Vec<u8> = if buf.len() >= need {
+            let start = buf.len() - need;
+            buf[start..start + footer_size as usize].to_vec()
+        } else {
+            source.read_vec(footer_offset, footer_size as usize)?
+        };
+
         let index = Index::decode(&payload)?;
         if index.encoded_size() != footer_size {
             return Err(io::Error::new(
@@ -96,6 +120,7 @@ impl<R: RangeReader> Reader<R> {
                 ),
             ));
         }
+        let triangle_count = index.triangle_count_u32()?;
 
         Ok(Reader {
             source,

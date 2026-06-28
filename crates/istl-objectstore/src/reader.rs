@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::{StreamExt, TryStreamExt};
 use istl_core::RangeReader;
@@ -16,43 +16,45 @@ use super::{map_err, runtime};
 pub const DEFAULT_BATCH_CONCURRENCY: usize = 16;
 
 /// `RangeReader` over any `object_store` backend. Each `read_at` is one range GET.
+///
+/// Construction does **no** I/O — neither a HEAD nor a GET. The object size is
+/// learned lazily, populated by the first `prefetch_tail` call (issued from
+/// `Reader::open_source` in the common path) via the response's
+/// `Content-Range` header on the suffix-range GET.
 pub struct ObjectStoreSource {
     store: Arc<dyn ObjectStore>,
     path: Path,
-    len: u64,
+    len: OnceLock<u64>,
     concurrency: NonZeroUsize,
 }
 
 impl ObjectStoreSource {
     /// Open an object addressed by a URL (`s3://`, `gs://`, `az://`,
-    /// `http(s)://`, `file://`, `memory://`). One `head` request is issued to
-    /// learn the object size.
+    /// `http(s)://`, `file://`, `memory://`). Does not issue any I/O — the
+    /// size is fetched lazily, ideally folded into the first `prefetch_tail`
+    /// call.
     pub fn open_url(url: &str) -> io::Result<Self> {
         let parsed =
             Url::parse(url).map_err(|e| io::Error::other(format!("bad URL {url:?}: {e}")))?;
         let (store, path) = parse_url(&parsed).map_err(map_err)?;
-        Self::open(Arc::from(store), path)
+        Ok(Self::new(Arc::from(store), path))
     }
 
     /// Open from an already-constructed `ObjectStore` + `Path`. Useful when
     /// the caller wants custom credentials or a shared client across many
-    /// sources (one connection pool for the whole process).
+    /// sources (one connection pool for the whole process). Does not issue
+    /// any I/O.
     pub fn open(store: Arc<dyn ObjectStore>, path: Path) -> io::Result<Self> {
-        let opts = GetOptions {
-            head: true,
-            ..Default::default()
-        };
-        let len = runtime()
-            .block_on(async { store.get_opts(&path, opts).await })
-            .map_err(map_err)?
-            .meta
-            .size;
-        Ok(ObjectStoreSource {
+        Ok(Self::new(store, path))
+    }
+
+    fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        ObjectStoreSource {
             store,
             path,
-            len,
+            len: OnceLock::new(),
             concurrency: NonZeroUsize::new(DEFAULT_BATCH_CONCURRENCY).unwrap(),
-        })
+        }
     }
 
     /// Override the number of concurrent range GETs issued by
@@ -69,11 +71,65 @@ impl ObjectStoreSource {
     pub fn concurrency(&self) -> NonZeroUsize {
         self.concurrency
     }
+
+    /// Resolve the cached object size, falling back to a HEAD if no prior call
+    /// has populated it. Returns `io::Result` for explicit error handling;
+    /// `RangeReader::len()` panics on transport error (documented contract).
+    fn fetch_len(&self) -> io::Result<u64> {
+        if let Some(&n) = self.len.get() {
+            return Ok(n);
+        }
+        let opts = GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        let n = runtime()
+            .block_on(async { self.store.get_opts(&self.path, opts).await })
+            .map_err(map_err)?
+            .meta
+            .size;
+        let _ = self.len.set(n);
+        Ok(n)
+    }
 }
 
 impl RangeReader for ObjectStoreSource {
+    /// Lazy: returns the cached object size, or HEADs the store if no prior
+    /// `prefetch_tail` / `read_at` has filled it in. Panics on transport
+    /// failure — `RangeReader::len()` is infallible. In the happy path through
+    /// `Reader::open_source` the cache is populated by the suffix-range
+    /// response before anything calls `len()`, so this fallback HEAD never
+    /// fires.
     fn len(&self) -> u64 {
-        self.len
+        self.fetch_len().expect("ObjectStoreSource::len lazy HEAD failed")
+    }
+
+    /// Single suffix-range GET: returns the last `max_tail_bytes` bytes plus
+    /// the total object size derived from `Content-Range`. Folds what would
+    /// otherwise be a HEAD + tail GET into one round trip.
+    fn prefetch_tail(&self, max_tail_bytes: u64) -> io::Result<(Vec<u8>, u64)> {
+        if max_tail_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prefetch_tail: max_tail_bytes must be > 0",
+            ));
+        }
+        let opts = GetOptions {
+            range: Some(GetRange::Suffix(max_tail_bytes)),
+            ..Default::default()
+        };
+        let (bytes, total) = runtime()
+            .block_on(async {
+                let res = self.store.get_opts(&self.path, opts).await?;
+                let total = res.meta.size;
+                let bytes = res.bytes().await?;
+                Ok::<_, object_store::Error>((bytes, total))
+            })
+            .map_err(map_err)?;
+        let _ = self.len.set(total);
+        // `Suffix(N)` returns up to N bytes (fewer if the object is shorter).
+        // Anything more would be a backend bug; trust the byte count.
+        Ok((bytes.to_vec(), total))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -360,12 +416,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("empty.bin");
         // The path doesn't even need to exist — an empty batch must not GET.
-        let src = ObjectStoreSource {
-            store,
-            path,
-            len: 0,
-            concurrency: NonZeroUsize::new(4).unwrap(),
-        };
+        let src = ObjectStoreSource::open(store, path)
+            .unwrap()
+            .with_concurrency(NonZeroUsize::new(4).unwrap());
         let mut out = Vec::new();
         src.read_to_writer_batch(&[], &mut out).unwrap();
         assert!(out.is_empty());
@@ -397,5 +450,188 @@ mod tests {
             .unwrap();
         assert_eq!(via_single, via_batch);
         assert_eq!(via_single, &payload[100..1334]);
+    }
+
+    /// `ObjectStore` adapter that counts every `get_opts` call, separating
+    /// HEAD-only requests from byte-fetching GETs. Used by the round-trip
+    /// tests below to assert the single-RTT open invariant.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        heads: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                heads: Default::default(),
+                gets: Default::default(),
+            })
+        }
+        fn heads(&self) -> usize {
+            self.heads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                self.heads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Build a self-contained ISTL with `group_count` row groups, each
+    /// claiming a 50-byte triangle slab. Triangle payloads are zeroed.
+    /// Returns the bytes ready for `put_opts`.
+    fn build_istl_bytes(group_count: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ISTL1\0\0\0");
+        bytes.extend_from_slice(&[0u8; 72]);
+        bytes.extend_from_slice(&group_count.to_le_bytes()); // triangle_count == group_count
+        for _ in 0..group_count {
+            bytes.extend_from_slice(&[0u8; 50]);
+        }
+        let footer_start = bytes.len() as u64;
+        bytes.extend_from_slice(&group_count.to_le_bytes());
+        let mut offset: u64 = 84;
+        for _ in 0..group_count {
+            bytes.extend_from_slice(&offset.to_le_bytes()); // byte_start
+            bytes.extend_from_slice(&50u64.to_le_bytes()); // byte_size
+            for _ in 0..6 {
+                bytes.extend_from_slice(&0f32.to_le_bytes());
+            }
+            offset += 50;
+        }
+        let footer_size = bytes.len() as u64 - footer_start;
+        bytes.extend_from_slice(&footer_size.to_le_bytes());
+        bytes.extend_from_slice(b"ISTLEND\0");
+        bytes
+    }
+
+    fn put_in_store(store: &Arc<dyn ObjectStore>, path: &Path, bytes: Vec<u8>) {
+        use object_store::{PutOptions, PutPayload};
+        runtime()
+            .block_on(async {
+                store
+                    .put_opts(
+                        path,
+                        PutPayload::from_bytes(bytes.into()),
+                        PutOptions::default(),
+                    )
+                    .await
+            })
+            .expect("put failed");
+    }
+
+    /// Open path issues exactly one range GET (and no HEAD) when the footer
+    /// fits inside the default tail hint.
+    #[test]
+    fn open_uses_one_get_when_footer_fits() {
+        use object_store::memory::InMemory;
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let counting = CountingStore::new(inner);
+        let store: Arc<dyn ObjectStore> = counting.clone();
+        let path = Path::from("small.istl");
+        // 8 groups → 4 + 8*40 = 324-byte footer; well under the 64 KB hint.
+        put_in_store(&store, &path, build_istl_bytes(8));
+
+        let pre_heads = counting.heads();
+        let pre_gets = counting.gets();
+        let src = ObjectStoreSource::open(store, path).unwrap();
+        let reader = istl_core::Reader::open_source(src).unwrap();
+        assert_eq!(reader.index.groups.len(), 8);
+        assert_eq!(counting.heads() - pre_heads, 0, "must not issue HEAD");
+        assert_eq!(counting.gets() - pre_gets, 1, "must issue exactly one GET");
+    }
+
+    /// When the footer is larger than the caller's tail hint, the open path
+    /// falls back to a single precise follow-up GET (2 GETs total, still no
+    /// HEAD).
+    #[test]
+    fn open_uses_two_gets_when_footer_exceeds_hint() {
+        use object_store::memory::InMemory;
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let counting = CountingStore::new(inner);
+        let store: Arc<dyn ObjectStore> = counting.clone();
+        let path = Path::from("big.istl");
+        // 64 groups → 4 + 64*40 = 2,564-byte footer. With a 1 KB tail hint
+        // the speculative read can't cover the full footer.
+        put_in_store(&store, &path, build_istl_bytes(64));
+
+        let pre_heads = counting.heads();
+        let pre_gets = counting.gets();
+        let src = ObjectStoreSource::open(store, path).unwrap();
+        let reader =
+            istl_core::Reader::open_source_with_tail_hint(src, 1024).unwrap();
+        assert_eq!(reader.index.groups.len(), 64);
+        assert_eq!(counting.heads() - pre_heads, 0, "must not issue HEAD");
+        assert_eq!(
+            counting.gets() - pre_gets,
+            2,
+            "expected speculative tail + precise follow-up = 2 GETs"
+        );
     }
 }

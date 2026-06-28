@@ -32,7 +32,7 @@ RUN maturin build \
 FROM public.ecr.aws/lambda/python:3.12-arm64
 
 COPY --from=builder /build/target/wheels/istl-*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/istl-*.whl boto3 \
+RUN pip install --no-cache-dir /tmp/istl-*.whl \
  && rm /tmp/istl-*.whl
 
 COPY lambda/app.py ${LAMBDA_TASK_ROOT}/

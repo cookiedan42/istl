@@ -1,9 +1,9 @@
 # `istl` on AWS Lambda (container image)
 
 A minimal container-image Lambda that reads an `.istl` file directly from S3
-via range GETs, runs a bbox query, and writes the resulting `.stl` back to S3.
-All the heavy lifting is in the Rust `istl` extension; the handler is ~20
-lines of Python.
+via range GETs, runs a bbox query, and writes the resulting `.stl` back to S3
+— streamed end-to-end with no `/tmp` round trip. All the heavy lifting is in
+the Rust `istl` extension; the handler is ~15 lines of Python.
 
 The container is built for **arm64 / Graviton** by default. See "Other
 architectures" below to switch to x86_64.
@@ -13,7 +13,7 @@ architectures" below to switch to x86_64.
 | Path | Purpose |
 |---|---|
 | `Dockerfile` | Two-stage build: manylinux2014 wheel builder → `public.ecr.aws/lambda/python:3.12-arm64`. |
-| `app.py` | Lambda handler. Calls `istl.query_url(src, /tmp/result.stl, bbox)` then uploads via `boto3`. |
+| `app.py` | Lambda handler. Calls `istl.query(src_url, dst_url, bbox)` — streams S3 → S3 directly. |
 | `event.example.json` | Sample invocation payload. |
 | `../.dockerignore` | (repo root) Keeps `data/`, `target/`, the venv etc. out of the build context. |
 
@@ -24,7 +24,8 @@ The handler API:
   "src_url":    "s3://bucket/key.istl",         # source .istl
   "dst_bucket": "bucket",                       # destination bucket
   "dst_key":    "path/result.stl",              # destination object key
-  "bbox":       [xmin, ymin, zmin, xmax, ymax, zmax]
+  "bbox":       [xmin, ymin, zmin, xmax, ymax, zmax],
+  "format":     "stl"                           # optional, "stl" (default) or "istl"
 }
 ```
 
@@ -133,7 +134,7 @@ policy for S3:
     },
     {
       "Effect": "Allow",
-      "Action": "s3:PutObject",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
       "Resource": "arn:aws:s3:::DST-BUCKET/*"
     }
   ]
@@ -142,7 +143,9 @@ policy for S3:
 
 Lambda injects `AWS_REGION` and the execution-role credentials into the
 environment automatically — the `object_store` AWS backend used by
-`istl.query_url` picks them up with no extra config.
+`istl.query` picks them up with no extra config. The output is streamed to S3
+via the same backend (multipart upload under the hood), so `/tmp` is not
+touched and the 512 MB ephemeral-storage cap doesn't apply.
 
 ### Invoke
 
@@ -169,6 +172,6 @@ To build an x86_64 image, edit `Dockerfile`:
 ## See also
 
 - [`crates/istl-py/README.md`](../crates/istl-py/README.md) — Python API
-  reference for `istl.query_url` and friends.
+  reference for `istl.query` and friends.
 - [`CLAUDE.md`](../CLAUDE.md) — architecture notes, format spec, performance
   numbers.

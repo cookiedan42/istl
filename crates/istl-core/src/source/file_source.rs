@@ -25,7 +25,7 @@ impl FileSource {
 }
 
 impl RangeReader for FileSource {
-    fn len(&self) -> as u64 {
+    fn len(&self) -> u64 {
         self.len
     }
 

@@ -1,5 +1,5 @@
 use super::RangeReader;
-use std::io;
+use std::io::{self, Write};
 
 /// `RangeReader` over any in-memory byte buffer. Useful for tests and for
 /// callers that have already pulled the file into RAM.
@@ -32,5 +32,24 @@ impl<B: AsRef<[u8]>> RangeReader for BytesSource<B> {
         let start = offset as usize;
         buf.copy_from_slice(&src[start..start + buf.len()]);
         Ok(())
+    }
+
+    fn read_to_writer<W: Write + ?Sized>(
+        &self,
+        offset: u64,
+        n: u64,
+        out: &mut W,
+    ) -> io::Result<()> {
+        let src = self.bytes.as_ref();
+        let end = offset
+            .checked_add(n)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        if end > src.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read_at past end of buffer",
+            ));
+        }
+        out.write_all(&src[offset as usize..end as usize])
     }
 }

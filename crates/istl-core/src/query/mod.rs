@@ -27,9 +27,6 @@ pub struct Reader<R: RangeReader> {
     pub footer_offset: u64,
     pub footer_size: u64,
     pub triangle_count: u32,
-    /// Largest `byte_size` across all groups in `index`. Used to size the
-    /// per-query scratch buffer so it fits any single group exactly.
-    max_group_size: u64,
 }
 
 impl Reader<FileSource> {
@@ -100,15 +97,12 @@ impl<R: RangeReader> Reader<R> {
             ));
         }
 
-        let max_group_size = index.groups.iter().map(|g| g.byte_size).max().unwrap_or(0);
-
         Ok(Reader {
             source,
             index,
             footer_offset,
             footer_size,
             triangle_count,
-            max_group_size,
         })
     }
 
@@ -148,15 +142,9 @@ impl<R: RangeReader> Reader<R> {
         out.write_all(StlFormat::HEADER)?;
         out.write_all(&tri_count_u32.to_le_bytes())?;
 
-        if !matched.is_empty() {
-            let mut buf = vec![0u8; self.max_group_size as usize];
-
-            for g in &matched {
-                let slab = &mut buf[..g.byte_size as usize];
-                self.source.read_at(g.byte_start, slab)?;
-                out.write_all(slab)?;
-            }
-        }
+        let ranges: Vec<(u64, u64)> =
+            matched.iter().map(|g| (g.byte_start, g.byte_size)).collect();
+        self.source.read_to_writer_batch(&ranges, out)?;
 
         Ok(QueryStats {
             groups_matched: matched.len() as u64,
@@ -189,33 +177,27 @@ impl<R: RangeReader> Reader<R> {
 
         let offset_head: u64 = (STL_HEADER_LEN + 4) as u64;
 
+        // Rebuilt RowGroups carry the SAME byte_size and bbox as the source
+        // groups but contiguous byte_starts beginning right after the header.
+        // Computed off the read path so the batch read below can fan out.
         let mut cur_offset: u64 = offset_head;
-
         let mut groups: Vec<RowGroup> = Vec::with_capacity(matched.len());
-
-        if !matched.is_empty() {
-            let mut buf = vec![0u8; self.max_group_size as usize];
-
-            for g in &matched {
-                let byte_start = cur_offset;
-                let slab = &mut buf[..g.byte_size as usize];
-                self.source.read_at(g.byte_start, slab)?;
-                out.write_all(slab)?;
-
-                // added parts for istl
-                cur_offset += g.byte_size;
-                groups.push(RowGroup {
-                    byte_start,
-                    byte_size: g.byte_size,
-                    bbox: g.bbox,
-                });
-            }
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(matched.len());
+        for g in &matched {
+            groups.push(RowGroup {
+                byte_start: cur_offset,
+                byte_size: g.byte_size,
+                bbox: g.bbox,
+            });
+            ranges.push((g.byte_start, g.byte_size));
+            cur_offset += g.byte_size;
         }
-
         debug_assert_eq!(
             cur_offset,
             (STL_HEADER_LEN + 4) as u64 + matched.iter().map(|g| g.byte_size).sum::<u64>()
         );
+
+        self.source.read_to_writer_batch(&ranges, out)?;
 
         let index = Index { groups };
         let footer_size = index.encoded_size();

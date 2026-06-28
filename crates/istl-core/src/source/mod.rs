@@ -11,7 +11,7 @@
 //! Remote-IO implementations (S3, HTTP) live in separate crates so this crate
 //! stays dependency-free.
 
-use std::io;
+use std::io::{self, Write};
 
 mod byte_source;
 pub use byte_source::BytesSource;
@@ -41,6 +41,53 @@ pub trait RangeReader {
         let mut v = vec![0u8; n];
         self.read_at(offset, &mut v)?;
         Ok(v)
+    }
+
+    /// Stream `n` bytes at `offset` directly into `out`. The default impl
+    /// chunks through a 64 KB scratch buffer; remote backends should override
+    /// to push range-GET response bytes straight to the writer without
+    /// allocating the whole slab. Used by `Reader::query_to_writer` so a
+    /// matched row group never has to land in a caller-side `Vec`.
+    fn read_to_writer<W: Write + ?Sized>(
+        &self,
+        offset: u64,
+        n: u64,
+        out: &mut W,
+    ) -> io::Result<()> {
+        const CHUNK: usize = 64 * 1024;
+        if n == 0 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; CHUNK.min(n as usize)];
+        let mut remaining = n;
+        let mut cur = offset;
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            self.read_at(cur, &mut buf[..take])?;
+            out.write_all(&buf[..take])?;
+            cur += take as u64;
+            remaining -= take as u64;
+        }
+        Ok(())
+    }
+
+    /// Read every `(offset, byte_size)` range and write them to `out` in
+    /// submission order — used by `Reader::query_to_writer` to dispatch all
+    /// matched row-group reads in one trait call. The default impl is a serial
+    /// loop over `read_to_writer`, identical to issuing the reads one by one.
+    ///
+    /// Remote backends (e.g. `ObjectStoreSource`) should override to issue the
+    /// reads concurrently while preserving output order — on S3 this turns a
+    /// `K × RTT` query into a roughly `K/N × RTT` one for large AOIs.
+    fn read_to_writer_batch<W: Write + ?Sized>(
+        &self,
+        ranges: &[(u64, u64)],
+        out: &mut W,
+    ) -> io::Result<()> {
+        for &(offset, n) in ranges {
+            self.read_to_writer(offset, n, out)?;
+        }
+        Ok(())
     }
 }
 

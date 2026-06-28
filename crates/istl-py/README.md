@@ -29,6 +29,9 @@ stats = istl.convert("terrain.stl", "terrain.istl")
 
 # Query: emit every triangle in any row group whose 3D bbox intersects
 # (xmin, ymin, zmin, xmax, ymax, zmax). Use `-inf`/`inf` to drop an axis.
+# `input` and `output` may be local paths or URLs (s3://, gs://, az://,
+# http(s)://, file://, memory://). `format` defaults to "stl" (vanilla
+# binary STL) — pass "istl" to emit an indexed file that can be queried again.
 res = istl.query(
     "terrain.istl",
     "aoi.stl",
@@ -36,6 +39,15 @@ res = istl.query(
           31340.0, 33036.0, float("inf")),
 )
 # res == {"groups_matched": 3, "triangles_written": 24576}
+
+# Land the result straight on S3, in indexed form:
+istl.query(
+    "s3://my-bucket/terrain.istl",
+    "s3://my-bucket/aoi.istl",
+    bbox=(31140.0, 32863.0, float("-inf"),
+          31340.0, 33036.0, float("inf")),
+    format="istl",
+)
 
 # Inspect the footer index without copying any triangles.
 groups = istl.read_index("terrain.istl")
@@ -126,11 +138,41 @@ a smaller index and fewer requests, at the cost of more over-fetch per
 match. The format itself is agnostic — this is a writer-side knob you can
 re-tune per deployment by re-running `convert`.
 
-### `istl.query(input, output, bbox) -> dict`
+### `istl.query(input, output, bbox, format="stl") -> dict`
+
+`input` and `output` are each a local path or a URL. Supported URL schemes
+(via the `remote` cargo feature, on by default) are listed below — the same
+call works against S3, GCS, Azure Blob, generic HTTP, and the local
+filesystem, backed by
+[`object_store`](https://crates.io/crates/object_store). Remote reads are
+range GETs (no full download); remote writes use multipart upload for large
+results and a single `put` for small ones.
+
+| URL scheme | Backend |
+|---|---|
+| `s3://bucket/key` | AWS S3 (env/profile/IMDS/Lambda role auth) |
+| `gs://bucket/key` | Google Cloud Storage |
+| `az://container/blob` | Azure Blob Storage |
+| `http(s)://host/path` | Generic HTTP / WebDAV |
+| `file:///abs/path` | Local filesystem |
+| `memory:///path` | In-memory (mostly tests; not shared across calls) |
 
 `bbox` is a 6-tuple `(xmin, ymin, zmin, xmax, ymax, zmax)`. `min > max` on any
 axis raises `ValueError`. Use `float("-inf")` / `float("inf")` to disable an
-axis (e.g. XY-only queries). Returns `{"groups_matched", "triangles_written"}`.
+axis (e.g. XY-only queries).
+
+`format` selects the output:
+- `"stl"` (default) — a vanilla binary STL (80-byte zero header + `u32`
+  count + triangles). Consumable by any STL reader.
+- `"istl"` — an indexed `.istl` file. Matched row groups are streamed
+  verbatim and a new footer is written; the result is itself queryable
+  and inherits the source's per-group bboxes.
+
+Returns `{"groups_matched", "triangles_written"}`.
+
+For builds without remote support: `uv run maturin develop --no-default-features
+--features pyo3/extension-module ...`. URL inputs/outputs then raise
+`OSError` with a clear "requires the `remote` feature" message.
 
 ### `istl.read_index(path) -> list[dict]`
 

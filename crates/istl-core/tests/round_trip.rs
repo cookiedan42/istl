@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use istl_core::{Bbox, Reader, STL_HEADER_LEN, TRI_SIZE, convert};
+use istl_core::{Bbox, BytesSource, Reader, STL_HEADER_LEN, TRI_SIZE, convert};
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("istl-test-{name}-{}", std::process::id()));
@@ -119,6 +119,179 @@ fn query_subset_and_full() {
             .unwrap(),
     );
     assert_eq!(cnt, 0);
+}
+
+#[test]
+fn reader_works_over_bytes_source() {
+    // The same Reader code path that powers `Reader::open` (FileSource) must
+    // also work over an arbitrary RangeReader — that's the whole point of the
+    // trait. Read a converted .istl into memory and query it via BytesSource.
+    let dir = tmpdir("bytes");
+    let stl = dir.join("in.stl");
+    let istl = dir.join("out.istl");
+    let n = 800u32;
+    write_synthetic_stl(&stl, n, 20);
+    convert(&stl, &istl, 32).unwrap();
+
+    let bytes = fs::read(&istl).unwrap();
+    let src = BytesSource::new(bytes);
+    let reader = Reader::open_source(src).unwrap();
+    assert_eq!(reader.triangle_count, n);
+
+    // Query via the writer-based API (no temp file).
+    let qb = Bbox::from([3.0, 7.0, 3.0, 7.0, -1.0, 1.0]);
+    let mut buf: Vec<u8> = Vec::new();
+    let stats = reader.query_to_writer(&qb, &mut buf).unwrap();
+    assert!(stats.groups_matched > 0);
+    assert!(stats.triangles_written > 0);
+    // Output is a valid binary STL: 80 B header + u32 count + 50·N triangles.
+    assert_eq!(
+        buf.len() as u64,
+        STL_HEADER_LEN as u64 + 4 + stats.triangles_written * TRI_SIZE as u64
+    );
+    let count_in_file = u32::from_le_bytes(
+        buf[STL_HEADER_LEN..STL_HEADER_LEN + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(count_in_file as u64, stats.triangles_written);
+}
+
+#[test]
+fn query_istl_round_trip_full() {
+    // Bbox::UNIVERSE → output ISTL should round-trip every group from the source.
+    let dir = tmpdir("istl-full");
+    let stl = dir.join("in.stl");
+    let istl = dir.join("out.istl");
+    let n = 1000u32;
+    write_synthetic_stl(&stl, n, 32);
+    convert(&stl, &istl, 64).unwrap();
+
+    let src_reader = Reader::open(&istl).unwrap();
+    let out_istl = dir.join("all.istl");
+    let stats = src_reader.query_istl(&Bbox::UNIVERSE, &out_istl).unwrap();
+    assert_eq!(stats.triangles_written, n as u64);
+    assert_eq!(
+        stats.groups_matched as usize,
+        src_reader.index.groups.len()
+    );
+
+    let out_reader = Reader::open(&out_istl).unwrap();
+    assert_eq!(out_reader.triangle_count, n);
+    assert_eq!(
+        out_reader.index.groups.len(),
+        src_reader.index.groups.len()
+    );
+    // Per-group bbox and size are preserved verbatim.
+    for (a, b) in out_reader
+        .index
+        .groups
+        .iter()
+        .zip(src_reader.index.groups.iter())
+    {
+        assert_eq!(a.byte_size, b.byte_size);
+        assert_eq!(a.bbox, b.bbox);
+    }
+    // Footer self-locates correctly and groups are contiguous from 84.
+    assert_eq!(out_reader.footer_size, out_reader.index.encoded_size());
+    let mut cur = (STL_HEADER_LEN + 4) as u64;
+    for g in &out_reader.index.groups {
+        assert_eq!(g.byte_start, cur);
+        cur += g.byte_size;
+    }
+    assert_eq!(cur, out_reader.footer_offset);
+}
+
+#[test]
+fn query_istl_round_trip_subset() {
+    let dir = tmpdir("istl-subset");
+    let stl = dir.join("in.stl");
+    let istl = dir.join("out.istl");
+    let n = 1000u32;
+    write_synthetic_stl(&stl, n, 32);
+    convert(&stl, &istl, 64).unwrap();
+
+    let src_reader = Reader::open(&istl).unwrap();
+    let tight = Bbox::from([3.0, 6.0, 3.0, 6.0, -1.0, 1.0]);
+    let out_istl = dir.join("tight.istl");
+    let stats = src_reader.query_istl(&tight, &out_istl).unwrap();
+    assert!(stats.groups_matched > 0);
+    assert!((stats.groups_matched as usize) < src_reader.index.groups.len());
+
+    let out_reader = Reader::open(&out_istl).unwrap();
+    assert_eq!(
+        out_reader.index.groups.len() as u64,
+        stats.groups_matched
+    );
+    assert_eq!(out_reader.footer_size, out_reader.index.encoded_size());
+    // byte_starts contiguous from 84.
+    let mut cur = (STL_HEADER_LEN + 4) as u64;
+    for g in &out_reader.index.groups {
+        assert_eq!(g.byte_start, cur);
+        cur += g.byte_size;
+    }
+    assert_eq!(cur, out_reader.footer_offset);
+
+    // Re-querying the output ISTL with the same bbox must return the same
+    // triangles — proves the output is a self-consistent indexed file.
+    let mut tris_via_output: Vec<u8> = Vec::new();
+    out_reader
+        .query_to_writer(&tight, &mut tris_via_output)
+        .unwrap();
+    let mut tris_direct: Vec<u8> = Vec::new();
+    src_reader
+        .query_to_writer(&tight, &mut tris_direct)
+        .unwrap();
+    assert_eq!(tris_via_output, tris_direct);
+}
+
+#[test]
+fn query_istl_empty_match_is_valid() {
+    let dir = tmpdir("istl-empty");
+    let stl = dir.join("in.stl");
+    let istl = dir.join("out.istl");
+    write_synthetic_stl(&stl, 200, 10);
+    convert(&stl, &istl, 32).unwrap();
+
+    let reader = Reader::open(&istl).unwrap();
+    let far = Bbox::from([1e9, 2e9, 1e9, 2e9, 0.0, 1.0]);
+    let out = dir.join("empty.istl");
+    let stats = reader.query_istl(&far, &out).unwrap();
+    assert_eq!(stats.groups_matched, 0);
+    assert_eq!(stats.triangles_written, 0);
+
+    // Minimum valid ISTL: 80 header + 4 count + 0 triangles + 4 footer payload + 16 tail.
+    let size = fs::metadata(&out).unwrap().len();
+    assert_eq!(size, (STL_HEADER_LEN + 4 + 4 + 16) as u64);
+
+    let out_reader = Reader::open(&out).unwrap();
+    assert_eq!(out_reader.triangle_count, 0);
+    assert_eq!(out_reader.index.groups.len(), 0);
+}
+
+#[test]
+fn query_istl_via_bytes_source() {
+    let dir = tmpdir("istl-bytes");
+    let stl = dir.join("in.stl");
+    let istl = dir.join("out.istl");
+    let n = 800u32;
+    write_synthetic_stl(&stl, n, 20);
+    convert(&stl, &istl, 32).unwrap();
+
+    let bytes = fs::read(&istl).unwrap();
+    let src = BytesSource::new(bytes);
+    let reader = Reader::open_source(src).unwrap();
+
+    let qb = Bbox::from([3.0, 7.0, 3.0, 7.0, -1.0, 1.0]);
+    let mut buf: Vec<u8> = Vec::new();
+    let stats = reader.query_to_writer_istl(&qb, &mut buf).unwrap();
+    assert!(stats.groups_matched > 0);
+
+    // Reparse the in-memory result as ISTL.
+    let out_src = BytesSource::new(buf);
+    let out_reader = Reader::open_source(out_src).unwrap();
+    assert_eq!(out_reader.index.groups.len() as u64, stats.groups_matched);
+    assert_eq!(out_reader.footer_size, out_reader.index.encoded_size());
 }
 
 #[test]

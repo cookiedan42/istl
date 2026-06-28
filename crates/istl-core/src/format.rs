@@ -194,7 +194,7 @@ pub struct Index {
 impl Index {
     /// Encode the footer payload (count + records). Does NOT include the trailing
     /// `footer_size + TRAILER` block — that's written separately by the converter.
-    pub fn encode<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    pub fn encode<W: Write + ?Sized>(&self, w: &mut W) -> io::Result<()> {
         // group_count is bounded by STL's u32 triangle_count (≤ u32::MAX),
         // since group_size ≥ 1 guarantees groups ≤ triangles. No overflow path.
         let count = self.groups.len() as u32;

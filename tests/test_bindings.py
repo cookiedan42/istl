@@ -89,6 +89,65 @@ def test_query_superset_of_brute_force(tmp_stl, tmp_path):
     assert stats["triangles_written"] >= expected
 
 
+def test_query_format_istl_round_trips(tmp_stl, tmp_path):
+    """`format="istl"` writes a valid `.istl` whose index can be re-queried."""
+    stl = tmp_stl(n=400, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    sliced_istl = tmp_path / "sliced.istl"
+    sliced_stl = tmp_path / "sliced.stl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+
+    qb = (3.0, 3.0, -1.0, 8.0, 8.0, 1.0)
+    stats = istl.query(str(indexed), str(sliced_istl), bbox=qb, format="istl")
+    assert stats["groups_matched"] >= 1
+
+    # The sliced .istl re-parses through read_index.
+    sub_idx = istl.read_index(str(sliced_istl))
+    assert len(sub_idx) == stats["groups_matched"]
+    assert sub_idx[0]["byte_start"] == 84
+
+    # Re-querying the sliced ISTL with the SAME bbox yields the same triangles
+    # as querying the original ISTL — proves the sliced file is self-consistent.
+    s_via = istl.query(str(sliced_istl), str(sliced_stl), bbox=qb, format="stl")
+    s_direct = istl.query(str(indexed), str(tmp_path / "direct.stl"), bbox=qb)
+    assert s_via["triangles_written"] == s_direct["triangles_written"]
+    assert (
+        (tmp_path / "direct.stl").read_bytes()
+        == sliced_stl.read_bytes()
+    )
+
+
+def test_query_format_rejects_unknown(tmp_stl, tmp_path):
+    stl = tmp_stl(n=50, grid=10, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=16)
+    with pytest.raises(ValueError):
+        istl.query(
+            str(indexed),
+            str(tmp_path / "x.stl"),
+            bbox=(0.0, 0.0, -1.0, 10.0, 10.0, 1.0),
+            format="ply",
+        )
+
+
+def test_query_format_default_is_stl(tmp_stl, tmp_path):
+    """No `format=` kwarg should preserve the pre-change behavior (STL out)."""
+    stl = tmp_stl(n=100, grid=10, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    sliced = tmp_path / "sliced.bin"
+    istl.convert(str(stl), str(indexed), group_size=16)
+    istl.query(
+        str(indexed),
+        str(sliced),
+        bbox=(0.0, 0.0, -1.0, 10.0, 10.0, 1.0),
+    )
+    raw = sliced.read_bytes()
+    # Vanilla binary STL: 80-byte zero header (no ISTL magic).
+    assert raw[:8] != b"ISTL1\x00\x00\x00"
+    # No ISTLEND trailer.
+    assert raw[-8:] != b"ISTLEND\x00"
+
+
 def test_query_rejects_inverted_bbox(tmp_stl, tmp_path):
     stl = tmp_stl(n=50, grid=10, name="in.stl")
     indexed = tmp_path / "in.istl"

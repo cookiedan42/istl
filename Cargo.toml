@@ -4,6 +4,7 @@ members = [
     "crates/istl-core",
     "crates/istl-cli",
     "crates/istl-py",
+    "crates/istl-objectstore",
 ]
 
 [workspace.package]

@@ -1,0 +1,6 @@
+{
+  "src_url": "s3://my-bucket/terrain.istl",
+  "dst_bucket": "my-bucket",
+  "dst_key": "aoi/result.stl",
+  "bbox": [31140.0, 32863.0, -1e30, 31340.0, 33036.0, 1e30]
+}

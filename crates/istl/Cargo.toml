@@ -3,6 +3,12 @@ name = "istl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Indexed binary STL — Hilbert-sorted, bbox-indexed mesh format with fast spatial queries"
+repository = "https://github.com/cookiedan42/istl"
+homepage = "https://github.com/cookiedan42/istl"
+readme = "README.md"
+keywords = ["stl", "mesh", "geometry", "spatial-index", "hilbert"]
+categories = ["data-structures", "encoding", "science::geo"]
 
 [dependencies]
 bytemuck = "1.25.0"

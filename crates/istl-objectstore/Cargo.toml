@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-istl-core = { path = "../istl-core" }
+istl-core = { package = "istl", path = "../istl" }
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 url = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util"] }

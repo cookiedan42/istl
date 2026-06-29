@@ -4,7 +4,7 @@
 //! HTTP server, or in a `Vec<u8>`. Any type that implements [`RangeReader`] can be
 //! handed to `Reader::open_source` and queried.
 //!
-//! `istl-core` ships exactly two implementations:
+//! `istl` ships exactly two implementations:
 //! - [`FileSource`] — wraps a `std::fs::File` using `pread`/seek+read.
 //! - [`BytesSource`] — wraps any `AsRef<[u8]>` (handy for tests and in-memory data).
 //!

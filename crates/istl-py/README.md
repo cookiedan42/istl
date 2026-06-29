@@ -7,7 +7,7 @@ records each group's byte range and 3D bounding box. Spatial bbox queries then
 skip everything that can't possibly intersect.
 
 The Python module is a thin [`pyo3`](https://pyo3.rs) wrapper over the Rust
-`istl-core` crate — all the heavy lifting (sort, IO, bbox folding) happens in
+`istl` crate — all the heavy lifting (sort, IO, bbox folding) happens in
 Rust with the GIL released, so calls don't block other Python threads.
 
 ## What you get
@@ -80,8 +80,8 @@ uv run maturin develop \
 
 `maturin develop` builds the Rust cdylib in release mode and installs the
 `istl` module into the uv-managed `.venv`. Re-run it after any change to
-`crates/istl-py/` or `crates/istl-core/`. The bindings link directly against
-`istl-core` via a path dependency — there is no separate "Rust install" step.
+`crates/istl-py/` or `crates/istl/`. The bindings link directly against
+the `istl` crate via a path dependency — there is no separate "Rust install" step.
 
 You can then use the module via uv:
 

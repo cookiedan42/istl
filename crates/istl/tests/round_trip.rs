@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use istl_core::{Bbox, BytesSource, Reader, STL_HEADER_LEN, TRI_SIZE, convert};
+use istl::{Bbox, BytesSource, Reader, STL_HEADER_LEN, TRI_SIZE, convert};
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("istl-test-{name}-{}", std::process::id()));
@@ -149,11 +149,8 @@ fn reader_works_over_bytes_source() {
         buf.len() as u64,
         STL_HEADER_LEN as u64 + 4 + stats.triangles_written * TRI_SIZE as u64
     );
-    let count_in_file = u32::from_le_bytes(
-        buf[STL_HEADER_LEN..STL_HEADER_LEN + 4]
-            .try_into()
-            .unwrap(),
-    );
+    let count_in_file =
+        u32::from_le_bytes(buf[STL_HEADER_LEN..STL_HEADER_LEN + 4].try_into().unwrap());
     assert_eq!(count_in_file as u64, stats.triangles_written);
 }
 
@@ -171,17 +168,11 @@ fn query_istl_round_trip_full() {
     let out_istl = dir.join("all.istl");
     let stats = src_reader.query_istl(&Bbox::UNIVERSE, &out_istl).unwrap();
     assert_eq!(stats.triangles_written, n as u64);
-    assert_eq!(
-        stats.groups_matched as usize,
-        src_reader.index.groups.len()
-    );
+    assert_eq!(stats.groups_matched as usize, src_reader.index.groups.len());
 
     let out_reader = Reader::open(&out_istl).unwrap();
     assert_eq!(out_reader.triangle_count, n);
-    assert_eq!(
-        out_reader.index.groups.len(),
-        src_reader.index.groups.len()
-    );
+    assert_eq!(out_reader.index.groups.len(), src_reader.index.groups.len());
     // Per-group bbox and size are preserved verbatim.
     for (a, b) in out_reader
         .index
@@ -219,10 +210,7 @@ fn query_istl_round_trip_subset() {
     assert!((stats.groups_matched as usize) < src_reader.index.groups.len());
 
     let out_reader = Reader::open(&out_istl).unwrap();
-    assert_eq!(
-        out_reader.index.groups.len() as u64,
-        stats.groups_matched
-    );
+    assert_eq!(out_reader.index.groups.len() as u64, stats.groups_matched);
     assert_eq!(out_reader.footer_size, out_reader.index.encoded_size());
     // byte_starts contiguous from 84.
     let mut cur = (STL_HEADER_LEN + 4) as u64;

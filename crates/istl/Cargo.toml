@@ -1,5 +1,5 @@
 [package]
-name = "istl-core"
+name = "istl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

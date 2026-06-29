@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/istl-core",
+    "crates/istl",
     "crates/istl-cli",
     "crates/istl-py",
     "crates/istl-objectstore",

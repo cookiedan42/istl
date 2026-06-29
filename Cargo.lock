@@ -848,23 +848,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
-name = "istl-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "istl-core",
- "istl-objectstore",
- "url",
-]
-
-[[package]]
-name = "istl-core"
+name = "istl"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "memmap2",
  "rayon",
+]
+
+[[package]]
+name = "istl-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "istl",
+ "istl-objectstore",
+ "url",
 ]
 
 [[package]]
@@ -874,7 +874,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "istl-core",
+ "istl",
  "object_store",
  "tokio",
  "url",
@@ -884,7 +884,7 @@ dependencies = [
 name = "istl-py"
 version = "0.1.0"
 dependencies = [
- "istl-core",
+ "istl",
  "istl-objectstore",
  "pyo3",
  "url",

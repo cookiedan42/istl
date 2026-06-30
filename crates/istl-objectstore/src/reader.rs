@@ -4,10 +4,10 @@ use std::sync::{Arc, OnceLock};
 
 use futures::{StreamExt, TryStreamExt};
 use istl_core::RangeReader;
-use object_store::{GetOptions, GetRange, ObjectStore, parse_url, path::Path};
+use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
 use url::Url;
 
-use super::{map_err, runtime};
+use super::{map_err, parse_url_with_env, runtime};
 
 /// Default number of in-flight range GETs for [`ObjectStoreSource::read_to_writer_batch`].
 /// 16 is the conventional S3 sweet spot — saturates one client without
@@ -36,8 +36,8 @@ impl ObjectStoreSource {
     pub fn open_url(url: &str) -> io::Result<Self> {
         let parsed =
             Url::parse(url).map_err(|e| io::Error::other(format!("bad URL {url:?}: {e}")))?;
-        let (store, path) = parse_url(&parsed).map_err(map_err)?;
-        Ok(Self::new(Arc::from(store), path))
+        let (store, path) = parse_url_with_env(&parsed).map_err(map_err)?;
+        Ok(Self::new(store, path))
     }
 
     /// Open from an already-constructed `ObjectStore` + `Path`. Useful when

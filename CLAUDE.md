@@ -12,23 +12,23 @@ Plan & rationale: `/Users/seed1091/.claude/plans/this-project-aims-to-happy-snai
 
 Rust workspace (`Cargo.toml` at root) + uv-managed Python dev env (`pyproject.toml` at root).
 
-- `crates/istl-core/` — format constants, Hilbert mapping, converter, reader, `RangeReader` trait + `FileSource`/`BytesSource`. Pure Rust, no deps.
+- `crates/istl/` — format constants, Hilbert mapping, converter, reader, `RangeReader` trait + `FileSource`/`BytesSource`. Pure Rust, no deps.
 - `crates/istl-cli/` — `istl` binary (`convert` / `query` / `info` / `query-remote` subcommands, via `clap`).
 - `crates/istl-py/` — `pyo3` extension module exposing `convert`, `query`, `query_url`, `read_index`. Built with `maturin`.
 - `crates/istl-objectstore/` — `ObjectStoreSource` implementing `RangeReader` over any [`object_store`](https://crates.io/crates/object_store) backend (S3, GCS, Azure Blob, HTTP, local file, in-memory). `ObjectStoreSource::open_url("s3://bucket/key")` is the common entrypoint; same crate Parquet/Arrow uses for remote reads.
 
-The on-disk format spec lives in `crates/istl-core/src/format.rs`. Keep it in sync with the plan file's "Format spec" section if you change layout.
+The on-disk format spec lives in `crates/istl/src/format.rs`. Keep it in sync with the plan file's "Format spec" section if you change layout.
 
 ## Common commands
 
 Rust:
 - `cargo build --release -p istl-cli` — build the `istl` CLI to `target/release/istl`.
-- `cargo test -p istl-core` — runs unit tests (`format`, `hilbert`) and `tests/round_trip.rs` integration tests.
-- `cargo test -p istl-core --test round_trip <name>` — single integration test.
+- `cargo test -p istl` — runs unit tests (`format`, `hilbert`) and `tests/round_trip.rs` integration tests.
+- `cargo test -p istl --test round_trip <name>` — single integration test.
 
 Python bindings (uv + maturin):
 - `uv sync --group dev` — provision `.venv` with `maturin`, `pytest`, `meshio`, `numpy`.
-- `uv run maturin develop --release --manifest-path crates/istl-py/Cargo.toml` — build the cdylib and install `istl` into the uv venv. Re-run after any change in `crates/istl-py/` or `crates/istl-core/`.
+- `uv run maturin develop --release --manifest-path crates/istl-py/Cargo.toml` — build the cdylib and install `istl` into the uv venv. Re-run after any change in `crates/istl-py/` or `crates/istl/`.
 - `uv run pytest tests/` — Python verification suite. Tests build synthetic STLs in `tmp_path` (no fixtures on disk).
 - `uv run python tests/bench_naive_vs_indexed.py` — benchmark indexed query vs a numpy-mmap naive scan against `data/terrain.stl` and `/tmp/terrain.istl`. Requires running `istl convert` first. (Not picked up by pytest — `bench_*` prefix.)
 
@@ -59,7 +59,7 @@ End-to-end smoke against the bundled 2.5 GB sample:
 
 ## `group_size` tuning
 
-Default is `DEFAULT_GROUP_SIZE = 32_768` (constant exposed from `istl-core`, re-exported from the CLI, and accessible as `istl.DEFAULT_GROUP_SIZE` in Python). This targets object-store access — each group is ~1.6 MB (the start of the efficient parallel-GET band) and the footer fits a single ~64 KB speculative tail GET.
+Default is `DEFAULT_GROUP_SIZE = 32_768` (constant exposed from `istl`, re-exported from the CLI, and accessible as `istl.DEFAULT_GROUP_SIZE` in Python). This targets object-store access — each group is ~1.6 MB (the start of the efficient parallel-GET band) and the footer fits a single ~64 KB speculative tail GET.
 
 Lower it for local NVMe / mmap (e.g. 8 K) where per-request overhead is negligible and tighter bboxes win. Raise it for HDD/NFS (128 K+) where seeks dominate, or high-latency HTTP/edge.
 

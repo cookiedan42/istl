@@ -2,11 +2,11 @@ use std::io;
 use std::sync::Arc;
 
 use object_store::buffered::BufWriter as OsBufWriter;
-use object_store::{ObjectStore, parse_url, path::Path};
+use object_store::{ObjectStore, path::Path};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
-use super::{map_err, runtime};
+use super::{map_err, parse_url_with_env, runtime};
 
 /// `std::io::Write` sink over any `object_store` backend.
 ///
@@ -33,8 +33,8 @@ impl ObjectStoreSink {
     pub fn create_url(url: &str) -> io::Result<Self> {
         let parsed =
             Url::parse(url).map_err(|e| io::Error::other(format!("bad URL {url:?}: {e}")))?;
-        let (store, path) = parse_url(&parsed).map_err(map_err)?;
-        Ok(Self::create(Arc::from(store), path))
+        let (store, path) = parse_url_with_env(&parsed).map_err(map_err)?;
+        Ok(Self::create(store, path))
     }
 
     /// Open a sink from an already-constructed `ObjectStore` + `Path`.

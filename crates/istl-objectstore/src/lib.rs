@@ -42,15 +42,43 @@
 //! concurrent range GETs.
 
 use std::io;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use object_store::{ObjectStore, parse_url, path::Path};
 use tokio::runtime::Runtime;
+use url::Url;
 
 mod reader;
 pub use reader::ObjectStoreSource;
 
 mod writer;
 pub use writer::ObjectStoreSink;
+
+/// Parse a URL into an `ObjectStore` + `Path`.
+///
+/// Wraps [`object_store::parse_url`] with one specialization: for `s3://` URLs
+/// we build the [`AmazonS3`] via [`AmazonS3Builder::from_env`] instead of the
+/// default factory. This matters in **AWS Lambda**, where IMDS is disabled.
+/// `object_store`'s default S3 credential chain probes IMDSv2 first, which
+/// hangs/times out, and only then falls back to env vars. `from_env()` reads
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` /
+/// `AWS_REGION` / `AWS_ENDPOINT_URL` eagerly and skips the IMDS probe entirely.
+///
+/// Non-S3 URLs (`gs://`, `az://`, `http(s)://`, `file://`, `memory://`) go
+/// through `parse_url` unchanged.
+///
+/// [`AmazonS3`]: object_store::aws::AmazonS3
+/// [`AmazonS3Builder::from_env`]: object_store::aws::AmazonS3Builder::from_env
+pub(crate) fn parse_url_with_env(url: &Url) -> Result<(Arc<dyn ObjectStore>, Path), object_store::Error> {
+    if url.scheme() == "s3" {
+        use object_store::aws::AmazonS3Builder;
+        let store = AmazonS3Builder::from_env().with_url(url.as_str()).build()?;
+        let path = Path::from(url.path().trim_start_matches('/'));
+        return Ok((Arc::new(store), path));
+    }
+    let (store, path) = parse_url(url)?;
+    Ok((Arc::from(store), path))
+}
 
 // `head` and `get_range` live on `ObjectStoreExt`; we use `get_opts` directly
 // (which IS on `ObjectStore`) for both the size lookup and the range reads,

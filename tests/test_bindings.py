@@ -4,6 +4,7 @@ from pathlib import Path
 
 import istl
 import meshio
+import numpy as np
 import pytest
 
 
@@ -146,6 +147,111 @@ def test_query_format_default_is_stl(tmp_stl, tmp_path):
     assert raw[:8] != b"ISTL1\x00\x00\x00"
     # No ISTLEND trailer.
     assert raw[-8:] != b"ISTLEND\x00"
+
+
+def test_query_bytes_matches_file_output(tmp_stl, tmp_path):
+    """query_bytes returns the same payload as query writing to a file."""
+    stl = tmp_stl(n=400, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    on_disk = tmp_path / "sliced.stl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    qb = (3.0, 3.0, -1.0, 8.0, 8.0, 1.0)
+    stats_file = istl.query(str(indexed), str(on_disk), bbox=qb)
+    buf = istl.query_bytes(str(indexed), bbox=qb)
+
+    assert isinstance(buf, bytes)
+    assert buf == on_disk.read_bytes()
+    assert _stl_triangle_count_buf(buf) == stats_file["triangles_written"]
+
+
+def test_query_bytes_is_valid_binary_stl(tmp_stl, tmp_path):
+    """Decoded bytes look like a binary STL with the right triangle count and size."""
+    stl = tmp_stl(n=300, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    qb = (3.0, 3.0, -1.0, 8.0, 8.0, 1.0)
+    buf = istl.query_bytes(str(indexed), bbox=qb)
+    n = _stl_triangle_count_buf(buf)
+    assert n >= 1
+    # 80 B header + 4 B count + 50 B per triangle.
+    assert len(buf) == 80 + 4 + 50 * n
+
+
+def test_query_bytes_istl_format(tmp_stl, tmp_path):
+    stl = tmp_stl(n=300, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    qb = (3.0, 3.0, -1.0, 8.0, 8.0, 1.0)
+    buf = istl.query_bytes(str(indexed), bbox=qb, format="istl")
+    assert buf[:8] == b"ISTL1\x00\x00\x00"
+    assert buf[-8:] == b"ISTLEND\x00"
+
+
+def test_query_numpy_shape_dtype_and_vertices(tmp_stl, tmp_path):
+    stl = tmp_stl(n=400, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    qb = (3.0, 3.0, -1.0, 8.0, 8.0, 1.0)
+    arr = istl.query_numpy(str(indexed), bbox=qb)
+    stats = istl.query(str(indexed), str(tmp_path / "ref.stl"), bbox=qb)
+
+    assert isinstance(arr, np.ndarray)
+    assert arr.dtype == np.float32
+    assert arr.shape == (stats["triangles_written"], 3, 3)
+    # Synthetic STL: every vertex of triangle i is (i%grid, i//grid, 0).
+    # All three vertices per triangle are identical, so per-triangle XY is
+    # well-defined and must lie inside the matched superset.
+    xy = arr[:, 0, :2]
+    # All values are integer-valued floats from the synthetic builder.
+    assert np.array_equal(arr[:, 0], arr[:, 1])
+    assert np.array_equal(arr[:, 0], arr[:, 2])
+    # z is always 0.
+    assert np.all(arr[:, :, 2] == 0.0)
+    # Bounding-box: query returns a superset, so result XYs must lie within
+    # SOME matched group's bbox — at minimum, all triangles fit in [0, grid).
+    assert np.all(xy >= 0.0) and np.all(xy < 20.0)
+
+
+def test_query_numpy_matches_meshio_decode(tmp_stl, tmp_path):
+    """query_numpy and meshio reading the written-to-disk STL agree on vertices."""
+    stl = tmp_stl(n=300, grid=20, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    on_disk = tmp_path / "sliced.stl"
+    istl.convert(str(stl), str(indexed), group_size=24)
+    qb = (4.0, 4.0, -1.0, 9.0, 9.0, 1.0)
+    istl.query(str(indexed), str(on_disk), bbox=qb)
+    arr = istl.query_numpy(str(indexed), bbox=qb)
+    mesh = meshio.read(str(on_disk))
+
+    # meshio gives a flat vertex array + a (n, 3) face index. Reconstruct
+    # (n, 3, 3) and compare.
+    points = mesh.points.astype(np.float32)
+    faces = [c.data for c in mesh.cells if c.type == "triangle"][0]
+    reconstructed = points[faces]
+    assert reconstructed.shape == arr.shape
+    assert np.allclose(reconstructed, arr)
+
+
+def test_query_numpy_empty_result(tmp_stl, tmp_path):
+    stl = tmp_stl(n=100, grid=10, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=16)
+    # bbox far from any triangle.
+    arr = istl.query_numpy(str(indexed), bbox=(1e6, 1e6, -1.0, 1e6 + 1, 1e6 + 1, 1.0))
+    assert arr.shape == (0, 3, 3)
+    assert arr.dtype == np.float32
+
+
+def test_query_numpy_rejects_inverted_bbox(tmp_stl, tmp_path):
+    stl = tmp_stl(n=50, grid=10, name="in.stl")
+    indexed = tmp_path / "in.istl"
+    istl.convert(str(stl), str(indexed), group_size=16)
+    with pytest.raises(ValueError):
+        istl.query_numpy(str(indexed), bbox=(5.0, 0.0, 0.0, 0.0, 1.0, 1.0))
+
+
+def _stl_triangle_count_buf(buf: bytes) -> int:
+    return struct.unpack_from("<I", buf, 80)[0]
 
 
 def test_query_rejects_inverted_bbox(tmp_stl, tmp_path):

@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 istl-core = { package = "istl", path = "../istl" }
 istl-objectstore = { path = "../istl-objectstore", optional = true }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+numpy = "0.29"
 url = { version = "2", optional = true }
 
 [features]

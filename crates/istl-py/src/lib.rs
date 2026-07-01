@@ -2,9 +2,10 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
+use numpy::{PyArray3, PyArrayMethods};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use istl_core::QueryStats;
 
@@ -29,6 +30,23 @@ fn parse_format(s: &str) -> PyResult<OutputFormat> {
             "format must be \"stl\" or \"istl\", got {s:?}"
         ))),
     }
+}
+
+fn parse_bbox(bbox: (f32, f32, f32, f32, f32, f32)) -> PyResult<istl_core::Bbox> {
+    let (xmin, ymin, zmin, xmax, ymax, zmax) = bbox;
+    if !(xmin <= xmax && ymin <= ymax && zmin <= zmax) {
+        return Err(PyValueError::new_err(
+            "bbox has min > max on at least one axis",
+        ));
+    }
+    Ok(istl_core::Bbox {
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
+    })
 }
 
 enum Endpoint {
@@ -119,6 +137,33 @@ impl AnyReader {
             (AnyReader::Remote(r), OutputFormat::Istl) => r.query_to_writer_istl(bbox, out),
         }
     }
+
+    /// Read every matched row-group slab into a single contiguous `Vec<u8>` —
+    /// the raw 50-byte triangle records concatenated, with no STL header.
+    /// Used by `query_numpy` to fill a (N, 3, 3) float32 array.
+    fn query_raw_triangles(&self, bbox: &istl_core::Bbox) -> io::Result<(Vec<u8>, u64)> {
+        match self {
+            AnyReader::Local(r) => read_raw_groups(r, bbox),
+            #[cfg(feature = "remote")]
+            AnyReader::Remote(r) => read_raw_groups(r, bbox),
+        }
+    }
+}
+
+fn read_raw_groups<R: istl_core::RangeReader>(
+    reader: &istl_core::Reader<R>,
+    bbox: &istl_core::Bbox,
+) -> io::Result<(Vec<u8>, u64)> {
+    let matched = reader.matched_groups(bbox);
+    let total_bytes: u64 = matched.iter().map(|g| g.byte_size).sum();
+    let total_tris: u64 = matched.iter().map(|g| g.triangle_count()).sum();
+    let cap: usize = total_bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "result too large for memory"))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(cap);
+    let ranges: Vec<(u64, u64)> = matched.iter().map(|g| (g.byte_start, g.byte_size)).collect();
+    reader.source().read_to_writer_batch(&ranges, &mut buf)?;
+    Ok((buf, total_tris))
 }
 
 fn with_output_writer<F>(output: Endpoint, f: F) -> io::Result<QueryStats>
@@ -170,20 +215,7 @@ fn query<'py>(
     bbox: (f32, f32, f32, f32, f32, f32),
     format: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let (xmin, ymin, zmin, xmax, ymax, zmax) = bbox;
-    if !(xmin <= xmax && ymin <= ymax && zmin <= zmax) {
-        return Err(PyValueError::new_err(
-            "bbox has min > max on at least one axis",
-        ));
-    }
-    let q = istl_core::Bbox {
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        zmin,
-        zmax,
-    };
+    let q = parse_bbox(bbox)?;
     let fmt = parse_format(format)?;
     let input_endpoint = classify(input);
     let output_endpoint = classify(output);
@@ -197,6 +229,98 @@ fn query<'py>(
     d.set_item("groups_matched", stats.groups_matched)?;
     d.set_item("triangles_written", stats.triangles_written)?;
     Ok(d)
+}
+
+/// Query an .istl file with a 3D bbox and return the result as in-memory bytes.
+///
+/// Same input semantics as [`query`] (local path or URL). The returned `bytes`
+/// is a complete `.stl` (default) or `.istl` (`format="istl"`) payload,
+/// suitable for `trimesh.load(BytesIO(buf), file_type="stl")` or
+/// `meshio.read(BytesIO(buf), file_format="stl")`.
+///
+/// The whole result is held in RAM — fine for AOI-sized queries, expensive
+/// for whole-dataset queries. Use [`query`] with a file output for those.
+#[pyfunction]
+#[pyo3(signature = (input, bbox, format = "stl"))]
+fn query_bytes<'py>(
+    py: Python<'py>,
+    input: &str,
+    bbox: (f32, f32, f32, f32, f32, f32),
+    format: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let q = parse_bbox(bbox)?;
+    let fmt = parse_format(format)?;
+    let input_endpoint = classify(input);
+    let buf = py
+        .detach(move || -> io::Result<Vec<u8>> {
+            let reader = AnyReader::open(input_endpoint)?;
+            let mut buf: Vec<u8> = Vec::new();
+            reader.query_into(&q, fmt, &mut buf)?;
+            Ok(buf)
+        })
+        .map_err(io_err)?;
+    Ok(PyBytes::new(py, &buf))
+}
+
+/// Query an .istl file with a 3D bbox and return the result as a NumPy
+/// `(N, 3, 3) float32` array of triangle vertices (`array[i, v, :] = (x,y,z)`
+/// of vertex `v ∈ {0,1,2}` of triangle `i`).
+///
+/// Normals and per-triangle attribute bytes are dropped — vertices are what
+/// `trimesh.Trimesh(vertices=arr.reshape(-1,3), faces=...)` and most numpy
+/// pipelines want. Same superset semantics as [`query`].
+#[pyfunction]
+#[pyo3(signature = (input, bbox))]
+fn query_numpy<'py>(
+    py: Python<'py>,
+    input: &str,
+    bbox: (f32, f32, f32, f32, f32, f32),
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let q = parse_bbox(bbox)?;
+    let input_endpoint = classify(input);
+    let (raw, n_tris) = py
+        .detach(move || -> io::Result<(Vec<u8>, u64)> {
+            let reader = AnyReader::open(input_endpoint)?;
+            reader.query_raw_triangles(&q)
+        })
+        .map_err(io_err)?;
+
+    const TRI_SIZE: usize = 50;
+    const VERTS_OFFSET: usize = 12; // skip 12-byte normal
+    const VERTS_LEN: usize = 36; // 3 vertices × 3 f32 × 4 bytes
+
+    let n_tris_usize: usize = n_tris
+        .try_into()
+        .map_err(|_| PyValueError::new_err("result too large to fit in a numpy array"))?;
+    if raw.len() != n_tris_usize * TRI_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "internal: matched {} bytes, expected {} for {} triangles",
+            raw.len(),
+            n_tris_usize * TRI_SIZE,
+            n_tris_usize
+        )));
+    }
+
+    let arr = PyArray3::<f32>::zeros(py, [n_tris_usize, 3, 3], false);
+    // SAFETY: just allocated above, no other reference into it exists.
+    {
+        let dest: &mut [f32] = unsafe { arr.as_slice_mut()? };
+        // dest is 9 f32 per triangle, contiguous (C order). Copy the 36 vertex
+        // bytes out of each 50-byte triangle record.
+        let dest_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                dest.as_mut_ptr() as *mut u8,
+                dest.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        for i in 0..n_tris_usize {
+            let src_off = i * TRI_SIZE + VERTS_OFFSET;
+            let dst_off = i * VERTS_LEN;
+            dest_bytes[dst_off..dst_off + VERTS_LEN]
+                .copy_from_slice(&raw[src_off..src_off + VERTS_LEN]);
+        }
+    }
+    Ok(arr)
 }
 
 #[pyfunction]
@@ -222,6 +346,8 @@ fn read_index<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyList>> 
 fn istl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
+    m.add_function(wrap_pyfunction!(query_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(query_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(read_index, m)?)?;
     m.add("DEFAULT_GROUP_SIZE", istl_core::DEFAULT_GROUP_SIZE)?;
     Ok(())

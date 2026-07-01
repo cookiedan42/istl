@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "istl"
-version = "0.1.5"
+version = "0.1.6"
 requires-python = ">=3.10"
 description = "Indexed STL — Hilbert-sorted, bbox-indexed binary STL"
 readme = "README.md"

@@ -9,6 +9,12 @@ name = "istl"
 path = "src/main.rs"
 
 [dependencies]
-istl-core = { path = "../istl-core" }
+istl-core = { package = "istl", path = "../istl" }
+istl-objectstore = { path = "../istl-objectstore", optional = true }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+url = { version = "2", optional = true }
+
+[features]
+default = ["remote"]
+remote = ["dep:istl-objectstore", "dep:url"]

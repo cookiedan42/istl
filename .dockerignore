@@ -1,0 +1,15 @@
+target/
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.dylib
+*.pyd
+data/
+tests/
+tmp_test/
+*.istl
+.git/
+.gitignore
+CLAUDE.md
+references/
